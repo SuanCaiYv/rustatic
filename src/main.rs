@@ -1,11 +1,15 @@
 mod pool;
 
+use std::collections::{BTreeMap, LinkedList};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::os::fd::AsFd;
+use std::sync::mpsc;
+use ahash::AHashMap;
 use nix::sys::mman::{MapFlags, mmap, mprotect, munmap, ProtFlags};
+use rbtree::RBTree;
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -21,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // }
 
 fn main() {
+    let pool = pool::ThreadPool::new(4, 8, 12);
     core_affinity::set_for_current(core_affinity::CoreId { id: 0 });
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     let bind_addr: SocketAddr = "0.0.0.0:8190".parse().unwrap();
@@ -30,9 +35,9 @@ fn main() {
     let listener: TcpListener = socket.into();
     loop {
         let (stream, _) = listener.accept().unwrap();
-        std::thread::spawn(move || {
-            handle2(stream);
-        });
+        pool.execute(move || {
+            handle(stream);
+        }, Some(|| {}));
     }
 }
 
@@ -41,7 +46,7 @@ fn handle(stream: TcpStream) {
     core_affinity::set_for_current(core_affinity::CoreId { id: 1 });
     let file = OpenOptions::new()
         .read(true)
-        .open("/Users/slma/Downloads/Teams_osx.pkg")
+        .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
         .unwrap();
     let size = file.metadata().unwrap().len() as i64;
     let (res, size) = nix::sys::sendfile::sendfile(file.as_fd(), stream.as_fd(), 0, Some(size), None, None);
@@ -53,7 +58,7 @@ fn handle1(mut stream: TcpStream) {
     core_affinity::set_for_current(core_affinity::CoreId { id: 1 });
     let mut file = OpenOptions::new()
         .read(true)
-        .open("/Users/slma/Downloads/Teams_osx.pkg")
+        .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
         .unwrap();
     let size = file.metadata().unwrap().len() as usize;
     let mut buffer = vec![0; 1024 * 1024 * 8];
@@ -76,7 +81,7 @@ fn handle2(mut stream: TcpStream) {
     core_affinity::set_for_current(core_affinity::CoreId { id: 1 });
     let mut file = OpenOptions::new()
         .read(true)
-        .open("/Users/slma/Downloads/Teams_osx.pkg")
+        .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
         .unwrap();
     let size = file.metadata().unwrap().len() as usize;
     let map = unsafe {
