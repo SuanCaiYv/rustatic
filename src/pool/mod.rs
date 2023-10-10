@@ -1,185 +1,45 @@
-use ahash::AHashMap;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::thread::JoinHandle;
-use std::time::Duration;
-use sysinfo::{System, SystemExt};
-use tokio::sync::mpsc;
+use std::{
+    cmp::Reverse,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
-/// a thread pool for block syscall
-pub(crate) struct ThreadPool {
-    max_size: usize,
-    scale_size: usize,
-    default_size: usize,
-    workers_handle: Option<JoinHandle<()>>,
-    inner_tx: mpsc::Sender<Task>,
+use ahash::AHashMap;
+use priority_queue::PriorityQueue;
+use sysinfo::{System, SystemExt};
+use tokio::{
+    sync::mpsc::{
+        self,
+        error::{TryRecvError, TrySendError},
+    },
+    time::Instant,
+};
+use tracing::{debug, error, info, warn};
+
+pub(self) struct Task {
+    pub(crate) f: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
+    pub(crate) notify: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
 }
 
-impl ThreadPool {
-    pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
-        let mut sys = System::new();
-        sys.refresh_all();
-        let default_size = sys.cpus().len();
-
-        let (inner_tx, mut inner_rx) = mpsc::channel(default_size);
-
-        // the backend thread which manage the workers
-        let workers_handle = thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let mut workers = Vec::with_capacity(default_size);
-                    let mut task_senders = Vec::with_capacity(default_size);
-                    let mut status_map = AHashMap::new();
-
-                    let (idle_tx, mut idle_rx) = mpsc::channel(default_size * 8);
-                    for i in 0..default_size {
-                        let status = Arc::new(AtomicBool::new(false));
-                        let (task_tx, task_rx) = mpsc::channel(cache_size);
-                        status_map.insert(i, status.clone());
-
-                        let worker = Worker::new(i, task_rx, idle_tx.clone(), status);
-                        workers.push(worker);
-                        task_senders.push(task_tx);
-                    }
-
-                    let idle_duration = Duration::from_secs(61);
-                    let timer = tokio::time::sleep(idle_duration);
-                    tokio::pin!(timer);
-
-                    let mut kv_map = AHashMap::new();
-                    let mut order_map = BTreeMap::new();
-                    let mut next_wake = tokio::time::Instant::now();
-                    let mut next_id = 0;
-                    loop {
-                        tokio::select! {
-                        _ = &mut timer => {
-                            status_map.get(&next_id).map(|status| {
-                                if status.load(Ordering::Acquire) {
-                                    // todo delete the worker
-                                }
-                            });
-                            match order_map.first_key_value() {
-                                Some(entry) => {
-                                    next_wake = *entry.0;
-                                    next_id = *entry.1;
-                                    timer.as_mut().reset(next_wake);
-                                    order_map.remove(&next_wake);
-                                }
-                                None => {}
-                            };
-                        }
-                        task = inner_rx.recv() => {
-                            match task {
-                                Some(task) => {
-                                    let mut idx = 0;
-                                    let mut min = usize::MAX;
-                                    let mut count = 0;
-                                    task_senders.iter().for_each(|sender| {
-                                        if sender.capacity() < min {
-                                            min = sender.capacity();
-                                            idx = count;
-                                        }
-                                        count += 1;
-                                    });
-                                    if min == 0 {
-                                        _ = task_senders[idx].send(task).await;
-                                    } else {
-                                        if task_senders.len() < scale_size {
-                                            let status = Arc::new(AtomicBool::new(false));
-                                            let (task_tx, task_rx) = mpsc::channel(cache_size);
-                                            status_map.insert(workers[workers.len()-1].id + 1, status.clone());
-
-                                            let worker = Worker::new(workers[workers.len()-1].id + 1, task_rx, idle_tx.clone(), status);
-                                            workers.push(worker);
-                                            _ = task_tx.send(task).await;
-                                            task_senders.push(task_tx);
-                                        } else {
-                                            if task_senders[idx].try_send(task).is_ok() {} else {}
-                                        }
-                                    }
-                                }
-                                None => break,
-                            }
-                        }
-                        idle = idle_rx.recv() => {
-                            match idle {
-                                Some(id) => {
-                                    if let Some(old_time) = kv_map.get(&id) {
-                                        let old_time = *old_time;
-                                        order_map.remove(&old_time);
-                                        let trigger_instant = tokio::time::Instant::now() + idle_duration;
-                                        order_map.insert(trigger_instant, id);
-                                        kv_map.insert(id, trigger_instant);
-                                        if old_time == next_wake {
-                                            let next = match order_map.first_key_value() {
-                                                Some(entry) => entry,
-                                                None => (&trigger_instant, &id),
-                                            };
-                                            next_wake = *next.0;
-                                            next_id = *next.1;
-                                            timer.as_mut().reset(next_wake);
-                                        }
-                                    } else {
-                                        let trigger_instant = tokio::time::Instant::now() + idle_duration;
-                                        order_map.insert(trigger_instant, id);
-                                        kv_map.insert(id, trigger_instant);
-                                    }
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                    }
-                });
-        });
+impl Task {
+    pub(self) fn new<F, Notify>(f: F, notify: Notify) -> Self
+    where
+        F: FnOnce() -> () + Send + Sync + 'static,
+        Notify: FnOnce() -> () + Send + Sync + 'static,
+    {
         Self {
-            max_size,
-            scale_size,
-            default_size,
-            workers_handle: Some(workers_handle),
-            inner_tx,
+            f: Box::new(f),
+            notify: Box::new(notify),
         }
     }
 
-    /// if the cache queue for task is full, and number of threads reach the max_size,
-    /// then the call of this method will block until the cache queue is not full.
-    pub(crate) fn execute<F, Notify>(&self, f: F, notify: Option<Notify>) -> anyhow::Result<()>
-    where
-        F: FnOnce() + Send + Sync + 'static,
-        Notify: FnOnce() + Send + Sync + 'static,
-    {
-        let task = Task::new(f, notify);
-        self.inner_tx.blocking_send(task)?;
-        Ok(())
-    }
-
-    pub(crate) async fn execute_async<F, Notify>(
-        &self,
-        f: F,
-        notify: Option<Notify>,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce() + Send + Sync + 'static,
-        Notify: FnOnce() + Send + Sync + 'static,
-    {
-        let task = Task::new(f, notify);
-        self.inner_tx.send(task).await?;
-        Ok(())
-    }
-
-    pub(crate) fn shutdown(&self) {
-        unimplemented!()
-    }
-}
-
-impl Drop for ThreadPool {
-    fn drop(&mut self) {
-        self.workers_handle.take().unwrap().join().unwrap();
+    pub(self) fn run(self) {
+        (self.f)();
+        (self.notify)();
     }
 }
 
@@ -200,19 +60,32 @@ impl Worker {
             .name(format!("worker-{}", id))
             .spawn(move || loop {
                 let task = match task_receiver.try_recv() {
-                    Ok(task) => task,
-                    Err(_) => {
-                        status.store(true, Ordering::Release);
-                        _ = idle_notify.blocking_send(id);
-                        match task_receiver.blocking_recv() {
-                            Some(task) => {
-                                status.store(false, Ordering::Release);
-                                _ = idle_notify.blocking_send(id);
-                                task
-                            }
-                            None => break,
-                        }
+                    Ok(task) => {
+                        debug!("worker: {} try recv task success", id);
+                        status.store(false, Ordering::Release);
+                        task
                     }
+                    Err(e) => match e {
+                        TryRecvError::Empty => {
+                            debug!("worker: {} try recv task failed", id);
+                            status.store(true, Ordering::Release);
+                            warn!("worker: {} idle send", id);
+                            if idle_notify.blocking_send(id).is_err() {
+                                break;
+                            }
+                            match task_receiver.blocking_recv() {
+                                Some(task) => {
+                                    debug!("worker: {} blocking recv task success", id);
+                                    status.store(false, Ordering::Release);
+                                    task
+                                }
+                                None => break,
+                            }
+                        }
+                        TryRecvError::Disconnected => {
+                            break;
+                        }
+                    },
                 };
                 task.run();
             })
@@ -230,31 +103,216 @@ impl Drop for Worker {
     }
 }
 
-pub(self) struct Task {
-    pub(crate) f: Box<dyn FnOnce() + Send + Sync + 'static>,
-    pub(crate) notify: Box<dyn FnOnce() + Send + Sync + 'static>,
+/// a thread pool for block syscall
+pub(crate) struct ThreadPool {
+    workers_handle: Option<JoinHandle<()>>,
+    inner_tx: mpsc::Sender<Task>,
 }
 
-impl Task {
-    pub(crate) fn new<F, Notify>(f: F, notify: Option<Notify>) -> Self
-    where
-        F: FnOnce() + Send + Sync + 'static,
-        Notify: FnOnce() + Send + Sync + 'static,
-    {
-        match notify {
-            Some(notify) => Self {
-                f: Box::new(f),
-                notify: Box::new(notify),
-            },
-            None => Self {
-                f: Box::new(f),
-                notify: Box::new(|| {}),
-            },
+impl ThreadPool {
+    pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
+        let mut sys = System::new();
+        sys.refresh_all();
+        // let default_size = sys.cpus().len();
+        let default_size = 1;
+
+        let (inner_tx, mut inner_rx) = mpsc::channel(default_size);
+
+        // the backend thread which manage the workers
+        let workers_handle = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut workers = Vec::with_capacity(default_size);
+                    let mut task_senders = Vec::with_capacity(default_size);
+                    let mut status_map = AHashMap::new();
+                    let (idle_tx, mut idle_rx) = mpsc::channel(default_size * 8);
+
+                    for i in 0..default_size {
+                        let status = Arc::new(AtomicBool::new(false));
+                        let (task_tx, task_rx) = mpsc::channel(cache_size);
+                        let worker = Worker::new(i, task_rx, idle_tx.clone(), status.clone());
+
+                        status_map.insert(i, status);
+                        workers.push(worker);
+                        task_senders.push(task_tx);
+                    }
+
+                    let idle_duration = Duration::from_secs(1);
+                    let sleep_duration = Duration::from_secs(60 * 60 * 24 * 7);
+                    let timer = tokio::time::sleep(sleep_duration);
+                    tokio::pin!(timer);
+
+                    let mut pq: PriorityQueue<usize, Reverse<Instant>> = PriorityQueue::new();
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut timer => {
+                                // let entry = match pq.pop() {
+                                //     Some(entry) => entry,
+                                //     None => continue,
+                                // };
+                                // match status_map.get(&entry.0) {
+                                //     Some(status) => {
+                                //         if status.load(Ordering::Acquire) {
+                                //             let mut idx = usize::MAX;
+                                //             for i in 0..workers.len() {
+                                //                 if workers[i].id == entry.0 {
+                                //                     idx = i;
+                                //                 }
+                                //             }
+                                //             if idx == usize::MAX {
+                                //                 error!("worker: {} not found", entry.0);
+                                //                 break;
+                                //             }
+                                //             if workers.len() > default_size {
+                                //                 info!("remove worker: {}", entry.0);
+                                //                 workers.remove(idx);
+                                //                 task_senders.remove(idx);
+                                //                 status_map.remove(&entry.0);
+                                //             }
+                                //         } else {
+                                //             debug!("worker: {} is not idle", entry.0);
+                                //         }
+                                //     },
+                                //     None => continue,
+                                // }
+                                // let reset_time = match pq.peek() {
+                                //     Some(entry) => {
+                                //         entry.1.0
+                                //     }
+                                //     None => {
+                                //         warn!("no worker idle");
+                                //         Instant::now() + sleep_duration
+                                //     }
+                                // };
+                                // timer.as_mut().reset(reset_time);
+                            }
+                            idle = idle_rx.recv() => {
+                                match idle {
+                                    Some(id) => {
+                                        info!("worker: {} idle", id);
+                                        let trigger_instant = Instant::now() + idle_duration;
+                                        pq.push(id, Reverse(trigger_instant));
+                                        let reset_time = pq.peek().unwrap().1.0;
+                                        timer.as_mut().reset(reset_time);
+                                    }
+                                    None => {
+                                        error!("idle_rx recv None");
+                                        break;
+                                    },
+                                }
+                            }
+                            task = inner_rx.recv() => {
+                                match task {
+                                    Some(task) => {
+                                        let mut idx = 0;
+                                        let mut remain_size = 0;
+                                        let mut count = 0;
+                                        task_senders.iter().for_each(|sender| {
+                                            if sender.capacity() > remain_size {
+                                                remain_size = sender.capacity();
+                                                idx = count;
+                                            }
+                                            count += 1;
+                                        });
+                                        if remain_size == cache_size {
+                                            let worker_id = workers[idx].id;
+                                            debug!("direct send task to worker: {}", worker_id);
+
+                                            status_map.get(&worker_id).unwrap().store(false, Ordering::Release);
+                                            if let Err(e) = task_senders[idx].send(task).await {
+                                                error!("send task error: {:?}", e);
+                                            }
+                                        } else {
+                                            if task_senders.len() < scale_size {
+                                                let new_worker_id = workers[workers.len()-1].id + 1;
+                                                debug!("create new worker: {}", new_worker_id);
+
+                                                let status = Arc::new(AtomicBool::new(false));
+                                                let (task_tx, task_rx) = mpsc::channel(cache_size);
+                                                let worker = Worker::new(new_worker_id, task_rx, idle_tx.clone(), status.clone());
+
+                                                status_map.insert(new_worker_id, status);
+                                                workers.push(worker);
+                                                _ = task_tx.send(task).await;
+                                                task_senders.push(task_tx);
+                                            } else {
+                                                match task_senders[idx].try_send(task) {
+                                                    Ok(_) => {
+                                                        debug!("buffer: {} available", workers[idx].id);
+                                                    }
+                                                    Err(e) => {
+                                                        match e {
+                                                            TrySendError::Full(task) => {
+                                                                if workers.len() < max_size {
+                                                                    let new_worker_id = workers[workers.len()-1].id + 1;
+                                                                    debug!("create more worker: {}", new_worker_id);
+                                                                    let status = Arc::new(AtomicBool::new(false));
+                                                                    let (task_tx, task_rx) = mpsc::channel(cache_size);
+                                                                    let worker = Worker::new(new_worker_id, task_rx, idle_tx.clone(), status.clone());
+
+                                                                    status_map.insert(new_worker_id, status);
+                                                                    workers.push(worker);
+                                                                    _ = task_tx.send(task).await;
+                                                                    task_senders.push(task_tx);
+                                                                } else {
+                                                                    debug!("send task to worker: {}", workers[idx].id);
+                                                                    if let Err(e) = task_senders[idx].send(task).await {
+                                                                        println!("send task error: {:?}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            TrySendError::Closed(_task) => {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                });
+        });
+        Self {
+            workers_handle: Some(workers_handle),
+            inner_tx,
         }
     }
 
-    pub(crate) fn run(self) {
-        (self.f)();
-        (self.notify)();
+    /// if the cache queue for task is full, and number of threads reach the max_size,
+    /// then the call of this method will block until the cache queue is not full.
+    pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> () + Send + Sync + 'static,
+        Notify: FnOnce() -> () + Send + Sync + 'static,
+    {
+        let task = Task::new(f, notify);
+        self.inner_tx.blocking_send(task)?;
+        Ok(())
+    }
+
+    #[allow(unused)]
+    pub(crate) async fn execute_async<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> () + Send + Sync + 'static,
+        Notify: FnOnce() -> () + Send + Sync + 'static,
+    {
+        let task = Task::new(f, notify);
+        self.inner_tx.send(task).await?;
+        Ok(())
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        self.workers_handle.take().unwrap().join().unwrap();
     }
 }
