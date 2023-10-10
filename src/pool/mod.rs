@@ -18,7 +18,7 @@ use tokio::{
     },
     time::Instant,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 pub(self) struct Task {
     pub(crate) f: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
@@ -27,9 +27,9 @@ pub(self) struct Task {
 
 impl Task {
     pub(self) fn new<F, Notify>(f: F, notify: Notify) -> Self
-    where
-        F: FnOnce() -> () + Send + Sync + 'static,
-        Notify: FnOnce() -> () + Send + Sync + 'static,
+        where
+            F: FnOnce() -> () + Send + Sync + 'static,
+            Notify: FnOnce() -> () + Send + Sync + 'static,
     {
         Self {
             f: Box::new(f),
@@ -69,7 +69,6 @@ impl Worker {
                         TryRecvError::Empty => {
                             debug!("worker: {} try recv task failed", id);
                             status.store(true, Ordering::Release);
-                            warn!("worker: {} idle send", id);
                             if idle_notify.blocking_send(id).is_err() {
                                 break;
                             }
@@ -113,8 +112,7 @@ impl ThreadPool {
     pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
         let mut sys = System::new();
         sys.refresh_all();
-        // let default_size = sys.cpus().len();
-        let default_size = 1;
+        let default_size = sys.cpus().len();
 
         let (inner_tx, mut inner_rx) = mpsc::channel(default_size);
 
@@ -150,50 +148,50 @@ impl ThreadPool {
                     loop {
                         tokio::select! {
                             _ = &mut timer => {
-                                // let entry = match pq.pop() {
-                                //     Some(entry) => entry,
-                                //     None => continue,
-                                // };
-                                // match status_map.get(&entry.0) {
-                                //     Some(status) => {
-                                //         if status.load(Ordering::Acquire) {
-                                //             let mut idx = usize::MAX;
-                                //             for i in 0..workers.len() {
-                                //                 if workers[i].id == entry.0 {
-                                //                     idx = i;
-                                //                 }
-                                //             }
-                                //             if idx == usize::MAX {
-                                //                 error!("worker: {} not found", entry.0);
-                                //                 break;
-                                //             }
-                                //             if workers.len() > default_size {
-                                //                 info!("remove worker: {}", entry.0);
-                                //                 workers.remove(idx);
-                                //                 task_senders.remove(idx);
-                                //                 status_map.remove(&entry.0);
-                                //             }
-                                //         } else {
-                                //             debug!("worker: {} is not idle", entry.0);
-                                //         }
-                                //     },
-                                //     None => continue,
-                                // }
-                                // let reset_time = match pq.peek() {
-                                //     Some(entry) => {
-                                //         entry.1.0
-                                //     }
-                                //     None => {
-                                //         warn!("no worker idle");
-                                //         Instant::now() + sleep_duration
-                                //     }
-                                // };
-                                // timer.as_mut().reset(reset_time);
+                                let entry = match pq.pop() {
+                                    Some(entry) => entry,
+                                    None => continue,
+                                };
+                                match status_map.get(&entry.0) {
+                                    Some(status) => {
+                                        if status.load(Ordering::Acquire) {
+                                            let mut idx = usize::MAX;
+                                            for i in 0..workers.len() {
+                                                if workers[i].id == entry.0 {
+                                                    idx = i;
+                                                }
+                                            }
+                                            if idx == usize::MAX {
+                                                error!("worker: {} not found", entry.0);
+                                                break;
+                                            }
+                                            if workers.len() > default_size {
+                                                debug!("remove worker: {}", entry.0);
+                                                task_senders.remove(idx);
+                                                workers.remove(idx);
+                                                status_map.remove(&entry.0);
+                                            }
+                                        } else {
+                                            debug!("worker: {} is not idle", entry.0);
+                                        }
+                                    },
+                                    None => continue,
+                                }
+                                let reset_time = match pq.peek() {
+                                    Some(entry) => {
+                                        entry.1.0
+                                    }
+                                    None => {
+                                        debug!("no worker idle");
+                                        Instant::now() + sleep_duration
+                                    }
+                                };
+                                timer.as_mut().reset(reset_time);
                             }
                             idle = idle_rx.recv() => {
                                 match idle {
                                     Some(id) => {
-                                        info!("worker: {} idle", id);
+                                        debug!("worker: {} idle", id);
                                         let trigger_instant = Instant::now() + idle_duration;
                                         pq.push(id, Reverse(trigger_instant));
                                         let reset_time = pq.peek().unwrap().1.0;
@@ -208,25 +206,36 @@ impl ThreadPool {
                             task = inner_rx.recv() => {
                                 match task {
                                     Some(task) => {
-                                        let mut idx = 0;
+                                        let mut index = 0;
+                                        let mut idle_idx = usize::MAX;
+                                        let mut sender_idx = 0;
                                         let mut remain_size = 0;
-                                        let mut count = 0;
-                                        task_senders.iter().for_each(|sender| {
-                                            if sender.capacity() > remain_size {
-                                                remain_size = sender.capacity();
-                                                idx = count;
+
+                                        workers.iter().for_each(|worker| {
+                                            status_map.get(&worker.id)
+                                                .map(|status| {
+                                                    if status.load(Ordering::Acquire) {
+                                                        idle_idx = index;
+                                                    }
+                                                });
+                                            if task_senders[index].capacity() > remain_size {
+                                                remain_size = task_senders[index].capacity();
+                                                sender_idx = index;
                                             }
-                                            count += 1;
+                                            index += 1;
                                         });
-                                        if remain_size == cache_size {
-                                            let worker_id = workers[idx].id;
-                                            debug!("direct send task to worker: {}", worker_id);
+
+                                        // first, select a idle worker
+                                        if idle_idx != usize::MAX {
+                                            let worker_id = workers[idle_idx].id;
+                                            debug!("send task to idle worker: {}", worker_id);
 
                                             status_map.get(&worker_id).unwrap().store(false, Ordering::Release);
-                                            if let Err(e) = task_senders[idx].send(task).await {
+                                            if let Err(e) = task_senders[idle_idx].send(task).await {
                                                 error!("send task error: {:?}", e);
                                             }
                                         } else {
+                                            // second, create new thread for task when allowed.
                                             if task_senders.len() < scale_size {
                                                 let new_worker_id = workers[workers.len()-1].id + 1;
                                                 debug!("create new worker: {}", new_worker_id);
@@ -240,13 +249,15 @@ impl ThreadPool {
                                                 _ = task_tx.send(task).await;
                                                 task_senders.push(task_tx);
                                             } else {
-                                                match task_senders[idx].try_send(task) {
+                                                // third, send task to the worker which has the most capacity.
+                                                match task_senders[sender_idx].try_send(task) {
                                                     Ok(_) => {
-                                                        debug!("buffer: {} available", workers[idx].id);
+                                                        debug!("buffer: {} available", workers[sender_idx].id);
                                                     }
                                                     Err(e) => {
                                                         match e {
                                                             TrySendError::Full(task) => {
+                                                                // last, create more threads before reach max size.
                                                                 if workers.len() < max_size {
                                                                     let new_worker_id = workers[workers.len()-1].id + 1;
                                                                     debug!("create more worker: {}", new_worker_id);
@@ -259,7 +270,10 @@ impl ThreadPool {
                                                                     _ = task_tx.send(task).await;
                                                                     task_senders.push(task_tx);
                                                                 } else {
-                                                                    debug!("send task to worker: {}", workers[idx].id);
+                                                                    // unfortunately, the system is busy.
+                                                                    // consider to increase the max size of thread pool or size of cache queue.
+                                                                    warn!("system is busy, queues and threads all full!");
+                                                                    let idx = fastrand::usize(0..workers.len());
                                                                     if let Err(e) = task_senders[idx].send(task).await {
                                                                         println!("send task error: {:?}", e);
                                                                     }
@@ -290,20 +304,20 @@ impl ThreadPool {
     /// if the cache queue for task is full, and number of threads reach the max_size,
     /// then the call of this method will block until the cache queue is not full.
     pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
-    where
-        F: FnOnce() -> () + Send + Sync + 'static,
-        Notify: FnOnce() -> () + Send + Sync + 'static,
+        where
+            F: FnOnce() -> () + Send + Sync + 'static,
+            Notify: FnOnce() -> () + Send + Sync + 'static,
     {
         let task = Task::new(f, notify);
         self.inner_tx.blocking_send(task)?;
         Ok(())
     }
 
-    #[allow(unused)]
+    /// if the cache queue is full and create more threads is not allow, the call will block on async context.
     pub(crate) async fn execute_async<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
-    where
-        F: FnOnce() -> () + Send + Sync + 'static,
-        Notify: FnOnce() -> () + Send + Sync + 'static,
+        where
+            F: FnOnce() -> () + Send + Sync + 'static,
+            Notify: FnOnce() -> () + Send + Sync + 'static,
     {
         let task = Task::new(f, notify);
         self.inner_tx.send(task).await?;

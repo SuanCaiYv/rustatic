@@ -3,6 +3,7 @@ use std::{sync::mpsc, thread, time::Duration};
 use tracing::Level;
 
 mod pool;
+mod net;
 
 // #[tokio::main]
 // async fn main() {
@@ -23,10 +24,10 @@ fn main() {
                 .with_level(true)
                 .with_target(true),
         )
-        .with_max_level(Level::INFO)
+        .with_max_level(Level::DEBUG)
         .try_init()
         .unwrap();
-    let pool = pool::ThreadPool::new(2, 3, 1);
+    let pool = pool::ThreadPool::new(24, 180, 1);
     _ = pool.execute(
         || {
             thread::sleep(Duration::from_secs(3));
@@ -48,34 +49,118 @@ fn main() {
         },
         || {},
     );
-    // _ = pool.execute(
-    //     || {
-    //         thread::sleep(Duration::from_secs(3));
-    //         println!("hello4");
-    //     },
-    //     || {},
-    // );
-    // _ = pool.execute(
-    //     || {
-    //         thread::sleep(Duration::from_secs(3));
-    //         println!("hello5");
-    //     },
-    //     || {},
-    // );
-    // _ = pool.execute(
-    //     || {
-    //         thread::sleep(Duration::from_secs(3));
-    //         println!("hello6");
-    //     },
-    //     || {},
-    // );
-    // _ = pool.execute(
-    //     || {
-    //         thread::sleep(Duration::from_secs(3));
-    //         println!("hello7");
-    //     },
-    //     || {},
-    // );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello4");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello5");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello6");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello7");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello8");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello9");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello10");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello11");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello12");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello13");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello14");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello15");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello16");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello17");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello18");
+        },
+        || {},
+    );
+    _ = pool.execute(
+        || {
+            thread::sleep(Duration::from_secs(3));
+            println!("hello19");
+        },
+        || {},
+    );
     let (_tx, rx) = mpsc::channel::<()>();
     _ = rx.recv();
     // core_affinity::set_for_current(core_affinity::CoreId { id: 0 });
