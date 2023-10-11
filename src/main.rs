@@ -4,6 +4,7 @@ use tracing::Level;
 
 mod pool;
 mod net;
+mod db;
 
 // #[tokio::main]
 // async fn main() {
@@ -185,7 +186,7 @@ fn main() {
 //         .read(true)
 //         .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
 //         .unwrap();
-//     let size = file.metadata().unwrap().len() as i64;
+//     let size = file.db().unwrap().len() as i64;
 //     let (res, size) = nix::sys::sendfile::sendfile(file.as_fd(), stream.as_fd(), 0, Some(size), None, None);
 //     println!("res: {:?}, size: {:?}", res, size);
 // }
@@ -197,7 +198,7 @@ fn main() {
 //         .read(true)
 //         .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
 //         .unwrap();
-//     let size = file.metadata().unwrap().len() as usize;
+//     let size = file.db().unwrap().len() as usize;
 //     let mut buffer = vec![0; 1024 * 1024 * 8];
 //     let mut total = 0;
 //     loop {
@@ -220,7 +221,7 @@ fn main() {
 //         .read(true)
 //         .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
 //         .unwrap();
-//     let size = file.metadata().unwrap().len() as usize;
+//     let size = file.db().unwrap().len() as usize;
 //     let map = unsafe {
 //         mmap(None, NonZeroUsize::new_unchecked(size), ProtFlags::PROT_READ, MapFlags::MAP_PRIVATE, Some(file.as_fd()), 0).unwrap()
 //     };
@@ -244,7 +245,7 @@ fn main() {
 //         .read(true)
 //         .open("/Users/slma/Downloads/Teams_osx.pkg")
 //         .unwrap();
-//     let size = file.metadata().unwrap().len() as usize;
+//     let size = file.db().unwrap().len() as usize;
 //
 //     let (pipe_rd, pipe_wr) = pipe().unwrap();
 //     loop {
