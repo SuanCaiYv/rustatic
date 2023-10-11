@@ -1,15 +1,17 @@
+use std::fs::OpenOptions;
 use std::future::Future;
 use bytes::BytesMut;
 use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use anyhow::anyhow;
 use base64::Engine;
 use futures::future::LocalBoxFuture;
+use nix::sys::sendfile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -71,6 +73,7 @@ impl Server {
 
         let conn_map = data_conn_map.clone();
         tokio::spawn(async move {
+            let thread_pool = Arc::new(ThreadPool::new(24, 180, 200));
             loop {
                 let (data_stream, _) = match data_listener.accept().await {
                     Ok(x) => x,
@@ -81,9 +84,10 @@ impl Server {
                 };
 
                 let conn_map = conn_map.clone();
+                let thread_pool = thread_pool.clone();
                 tokio::spawn(async move {
                     let (cmd_tx, cmd_rx) = mpsc::channel(32);
-                    let mut data_connection = DataConnection::new(data_stream, cmd_rx);
+                    let mut data_connection = DataConnection::new(data_stream, cmd_rx, thread_pool);
                     let connection_id = data_connection.init().await?;
                     conn_map.insert(connection_id, cmd_tx);
 
@@ -237,7 +241,7 @@ impl<'a> DataConnection<'a> {
             match self.cmd_rx.recv().await {
                 Some(cmd) => match cmd {
                     Cmd::Upload(req) => self.upload().await?,
-                    Cmd::Download(req) => self.download().await?,
+                    Cmd::Download(req) => self.download("").await?,
                 },
                 None => break,
             }
@@ -250,8 +254,27 @@ impl<'a> DataConnection<'a> {
     }
 
     pub(self) async fn download(&self, filepath: &str) -> anyhow::Result<()> {
-        self.thread_pool.execute_async(|| {}, || {}).await?;
+        let socket_fd = UnsafeFD { fd: self.stream.as_raw_fd() };
+        // Download {
+        //     filepath: Some(filepath.to_owned()),
+        //     socket_fd: self.stream.as_fd(),
+        //     thread_pool: Some(self.thread_pool.clone()),
+        //     send_future: None,
+        //     sent: false,
+        //     task_status: Arc::new(AtomicBool::new(false)),
+        // }.await?;
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(self) struct UnsafeFD {
+    fd: RawFd,
+}
+
+impl AsFd for UnsafeFD {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
     }
 }
 
@@ -261,22 +284,72 @@ pub(self) enum Cmd<'a> {
 }
 
 pub(self) struct Download {
-    filepath: String,
-    socket_fd: RawFd,
-    thread_pool: Arc<ThreadPool>,
+    filepath: Option<String>,
+    socket_fd: UnsafeFD,
+    thread_pool: Option<Arc<ThreadPool>>,
     send_future: Option<LocalBoxFuture<'static, anyhow::Result<()>>>,
-    io_task_status: Arc<AtomicBool>,
+    sent: bool,
+    task_status: Arc<AtomicBool>,
 }
 
 impl Unpin for Download {}
 
 impl Future for Download {
-    type Output = ();
+    type Output = anyhow::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let waker = cx.waker().clone();
-        let mut future = self.thread_pool.execute_async(|| {}, || {});
-        match future.as_mut().poll(cx) {}
-        Poll::Pending
+    fn poll(mut self: Pin<&mut Download>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.send_future.is_none() {
+            let waker = cx.waker().clone();
+            let status = self.task_status.clone();
+            let thread_pool = self.thread_pool.take().unwrap();
+            let filepath = self.filepath.take().unwrap();
+            let socket_fd = self.socket_fd;
+            let future = async move {
+                thread_pool.execute_async(move || {
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .open(filepath.as_str())
+                        .unwrap();
+                    let mut size = file.metadata().unwrap().len() as i64;
+                    let file_fd = file.as_fd();
+                    let mut offset = 0;
+                    loop {
+                        let (res, n) = sendfile::sendfile(file_fd, socket_fd, offset, Some(size), None, None);
+                        if res.is_err() {
+                            error!("download error: {}", res.unwrap_err());
+                            break;
+                        }
+                        if size == 0 {
+                            break;
+                        }
+                        offset += n;
+                        size -= n;
+                    }
+                }, move || {
+                    status.store(true, Ordering::Release);
+                    waker.wake();
+                }).await
+            };
+            self.send_future = Some(Box::pin(future));
+        }
+        if !self.sent {
+            match self.send_future.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Ready(Ok(_)) => {
+                    self.sent = true;
+                }
+                Poll::Ready(Err(e)) => {
+                    error!("download error: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+        if self.task_status.load(Ordering::Acquire) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 }

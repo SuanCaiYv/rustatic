@@ -138,7 +138,7 @@ impl ThreadPool {
                         task_senders.push(task_tx);
                     }
 
-                    let idle_duration = Duration::from_secs(1);
+                    let idle_duration = Duration::from_secs(61 * 60);
                     let sleep_duration = Duration::from_secs(60 * 60 * 24 * 7);
                     let timer = tokio::time::sleep(sleep_duration);
                     tokio::pin!(timer);
