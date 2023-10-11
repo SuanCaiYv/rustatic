@@ -1,24 +1,30 @@
-use std::fs::OpenOptions;
-use std::future::Future;
-use bytes::BytesMut;
-use dashmap::DashMap;
-use std::net::SocketAddr;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    fs::OpenOptions,
+    net::SocketAddr,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+};
+
 use anyhow::anyhow;
 use base64::Engine;
-use futures::future::LocalBoxFuture;
+use bytes::BytesMut;
+use dashmap::DashMap;
+use futures::{future::BoxFuture, Future};
 use nix::sys::sendfile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+};
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tracing::error;
 use uuid::Uuid;
+
 use crate::pool::ThreadPool;
 
 pub(self) const ALPN_RUSTATIC: &[&[u8]] = &[b"rustatic"];
@@ -60,13 +66,13 @@ impl Server {
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-            .await?;
+        .await?;
         let data_listener = TcpListener::bind(
             format!("0.0.0.0:{}", data_port)
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-            .await?;
+        .await?;
         let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
         let data_conn_map = Arc::new(DashMap::new());
@@ -189,26 +195,25 @@ impl Request {
     }
 
     fn parse1(req: &[u8]) -> anyhow::Result<(String, String)> {
-        let (username, password) =
-            match serde_json::from_slice::<serde_json::Value>(req) {
-                Ok(entry) => {
-                    let entry = match entry.as_object() {
-                        Some(e) => e,
-                        None => {
-                            error!("parse request error: not a json object");
-                            return Err(anyhow!("not a json object"));
-                        }
-                    };
-                    (
-                        entry.get("username").unwrap().as_str().unwrap().to_owned(),
-                        entry.get("password").unwrap().as_str().unwrap().to_owned(),
-                    )
-                }
-                Err(e) => {
-                    error!("parse request error: {}", e);
-                    return Err(anyhow!("parse request error"));
-                }
-            };
+        let (username, password) = match serde_json::from_slice::<serde_json::Value>(req) {
+            Ok(entry) => {
+                let entry = match entry.as_object() {
+                    Some(e) => e,
+                    None => {
+                        error!("parse request error: not a json object");
+                        return Err(anyhow!("not a json object"));
+                    }
+                };
+                (
+                    entry.get("username").unwrap().as_str().unwrap().to_owned(),
+                    entry.get("password").unwrap().as_str().unwrap().to_owned(),
+                )
+            }
+            Err(e) => {
+                error!("parse request error: {}", e);
+                return Err(anyhow!("parse request error"));
+            }
+        };
         Ok((username, password))
     }
 
@@ -228,8 +233,16 @@ pub(self) struct DataConnection<'a> {
 }
 
 impl<'a> DataConnection<'a> {
-    pub(self) fn new(stream: TcpStream, cmd_rx: mpsc::Receiver<Cmd<'a>>, thread_pool: Arc<ThreadPool>) -> Self {
-        Self { stream, cmd_rx, thread_pool }
+    pub(self) fn new(
+        stream: TcpStream,
+        cmd_rx: mpsc::Receiver<Cmd<'a>>,
+        thread_pool: Arc<ThreadPool>,
+    ) -> Self {
+        Self {
+            stream,
+            cmd_rx,
+            thread_pool,
+        }
     }
 
     pub(self) async fn init(&self) -> anyhow::Result<String> {
@@ -254,15 +267,17 @@ impl<'a> DataConnection<'a> {
     }
 
     pub(self) async fn download(&self, filepath: &str) -> anyhow::Result<()> {
-        let socket_fd = UnsafeFD { fd: self.stream.as_raw_fd() };
-        // Download {
-        //     filepath: Some(filepath.to_owned()),
-        //     socket_fd: self.stream.as_fd(),
-        //     thread_pool: Some(self.thread_pool.clone()),
-        //     send_future: None,
-        //     sent: false,
-        //     task_status: Arc::new(AtomicBool::new(false)),
-        // }.await?;
+        Download {
+            filepath: Some(filepath.to_owned()),
+            socket_fd: UnsafeFD {
+                fd: self.stream.as_raw_fd(),
+            },
+            thread_pool: Some(self.thread_pool.clone()),
+            send_future: None,
+            sent: false,
+            task_status: Arc::new(AtomicBool::new(false)),
+        }
+        .await?;
         Ok(())
     }
 }
@@ -287,7 +302,7 @@ pub(self) struct Download {
     filepath: Option<String>,
     socket_fd: UnsafeFD,
     thread_pool: Option<Arc<ThreadPool>>,
-    send_future: Option<LocalBoxFuture<'static, anyhow::Result<()>>>,
+    send_future: Option<BoxFuture<'static, anyhow::Result<()>>>,
     sent: bool,
     task_status: Arc<AtomicBool>,
 }
@@ -305,30 +320,42 @@ impl Future for Download {
             let filepath = self.filepath.take().unwrap();
             let socket_fd = self.socket_fd;
             let future = async move {
-                thread_pool.execute_async(move || {
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .open(filepath.as_str())
-                        .unwrap();
-                    let mut size = file.metadata().unwrap().len() as i64;
-                    let file_fd = file.as_fd();
-                    let mut offset = 0;
-                    loop {
-                        let (res, n) = sendfile::sendfile(file_fd, socket_fd, offset, Some(size), None, None);
-                        if res.is_err() {
-                            error!("download error: {}", res.unwrap_err());
-                            break;
-                        }
-                        if size == 0 {
-                            break;
-                        }
-                        offset += n;
-                        size -= n;
-                    }
-                }, move || {
-                    status.store(true, Ordering::Release);
-                    waker.wake();
-                }).await
+                thread_pool
+                    .execute_async(
+                        move || {
+                            let file = OpenOptions::new()
+                                .read(true)
+                                .open(filepath.as_str())
+                                .unwrap();
+                            let mut size = file.metadata().unwrap().len() as i64;
+                            let file_fd = file.as_fd();
+                            let mut offset = 0;
+                            loop {
+                                let (res, n) = sendfile::sendfile(
+                                    file_fd,
+                                    socket_fd,
+                                    offset,
+                                    Some(size),
+                                    None,
+                                    None,
+                                );
+                                if res.is_err() {
+                                    error!("download error: {}", res.unwrap_err());
+                                    break;
+                                }
+                                if size == 0 {
+                                    break;
+                                }
+                                offset += n;
+                                size -= n;
+                            }
+                        },
+                        move || {
+                            status.store(true, Ordering::Release);
+                            waker.wake();
+                        },
+                    )
+                    .await
             };
             self.send_future = Some(Box::pin(future));
         }
