@@ -2,7 +2,7 @@
 
 with the goal of fast, we choose zero-copying technology in Linux with `sendfile` of `mmap`, also the `splice` is included for test.
 
-we support plaintext transfer and 'tls' transfer, the 'tls' is not as same as the normal in https of ftps, it required encrypt first before storage on disk; not encrypt in-place.
+we support plaintext transfer and 'tls' transfer, the 'tls' is not as same as the normal in https or ftps, it required encrypt first before storage on disk; not encrypt in-place.
 
 ## Usage
 
