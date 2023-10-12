@@ -111,7 +111,7 @@ pub(crate) struct ThreadPool {
 impl ThreadPool {
     pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
         let mut sys = System::new();
-        sys.refresh_all();
+        sys.refresh_cpu();
         let default_size = sys.cpus().len();
 
         let (inner_tx, mut inner_rx) = mpsc::channel(default_size);

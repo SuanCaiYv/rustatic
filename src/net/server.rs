@@ -8,7 +8,9 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    cell::UnsafeCell,
 };
+use std::io::Write;
 
 use anyhow::anyhow;
 use base64::Engine;
@@ -18,12 +20,13 @@ use futures::{future::BoxFuture, Future};
 use nix::sys::sendfile;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}},
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tracing::error;
 use uuid::Uuid;
+use crate::db::get_user_ops;
 
 use crate::pool::ThreadPool;
 
@@ -66,13 +69,13 @@ impl Server {
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let data_listener = TcpListener::bind(
             format!("0.0.0.0:{}", data_port)
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
         let data_conn_map = Arc::new(DashMap::new());
@@ -218,6 +221,10 @@ impl Request {
     }
 
     pub(self) async fn sign(params: (String, String)) -> anyhow::Result<()> {
+        let (username, password) = params;
+        if get_user_ops().await.get(username).await?.is_some() {
+            return Err(anyhow!("user already exists"));
+        }
         Ok(())
     }
 
@@ -227,7 +234,9 @@ impl Request {
 }
 
 pub(self) struct DataConnection<'a> {
-    stream: TcpStream,
+    reader: Option<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+    raw_fd: RawFd,
     cmd_rx: mpsc::Receiver<Cmd<'a>>,
     thread_pool: Arc<ThreadPool>,
 }
@@ -238,8 +247,12 @@ impl<'a> DataConnection<'a> {
         cmd_rx: mpsc::Receiver<Cmd<'a>>,
         thread_pool: Arc<ThreadPool>,
     ) -> Self {
+        let raw_fd = stream.as_raw_fd();
+        let (reader, writer) = stream.into_split();
         Self {
-            stream,
+            reader: Some(reader),
+            writer,
+            raw_fd,
             cmd_rx,
             thread_pool,
         }
@@ -253,7 +266,7 @@ impl<'a> DataConnection<'a> {
         loop {
             match self.cmd_rx.recv().await {
                 Some(cmd) => match cmd {
-                    Cmd::Upload(req) => self.upload().await?,
+                    Cmd::Upload(req) => self.upload("", 0).await?,
                     Cmd::Download(req) => self.download("").await?,
                 },
                 None => break,
@@ -262,7 +275,51 @@ impl<'a> DataConnection<'a> {
         Ok(())
     }
 
-    pub(self) async fn upload(&self) -> anyhow::Result<()> {
+    pub(self) async fn upload(&mut self, filepath: &str, mut size: usize) -> anyhow::Result<()> {
+        let (tx, rx) = mpsc::channel(1);
+        let mut reader = self.reader.take().unwrap();
+        let handle = tokio::spawn(async move {
+            // 16KB as `page size` is large enough for most cases.
+            let buffer1 = BytesMut::with_capacity(4096 * 4);
+            let buffer2 = BytesMut::with_capacity(4096 * 4);
+            let mut buffer = buffer1.clone();
+            let mut flag = false;
+            while size > 0 {
+                let n = match reader.read(&mut buffer).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("read content error: {}", e);
+                        break;
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                size -= n;
+                if let Err(e) = tx.send((buffer.clone(), n)).await {
+                    error!("disk operation error: {}", e);
+                    break;
+                }
+                // to handle channel cache.
+                buffer = if flag {
+                    buffer1.clone()
+                } else {
+                    buffer2.clone()
+                };
+                flag = !flag;
+            }
+            reader
+        });
+        Upload {
+            filepath: Some(filepath.to_owned()),
+            content_rx: Some(rx),
+            thread_pool: Some(self.thread_pool.clone()),
+            send_future: None,
+            sent: false,
+            task_status: Arc::new(AtomicBool::new(false)),
+        }.await?;
+        // set back reader.
+        self.reader.replace(handle.await.unwrap());
         Ok(())
     }
 
@@ -270,14 +327,14 @@ impl<'a> DataConnection<'a> {
         Download {
             filepath: Some(filepath.to_owned()),
             socket_fd: UnsafeFD {
-                fd: self.stream.as_raw_fd(),
+                fd: self.raw_fd,
             },
             thread_pool: Some(self.thread_pool.clone()),
             send_future: None,
             sent: false,
             task_status: Arc::new(AtomicBool::new(false)),
         }
-        .await?;
+            .await?;
         Ok(())
     }
 }
@@ -296,6 +353,105 @@ impl AsFd for UnsafeFD {
 pub(self) enum Cmd<'a> {
     Upload(&'a [u8]),
     Download(&'a [u8]),
+}
+
+pub(super) struct UnsafePlaceholder<T> {
+    value: UnsafeCell<Option<T>>,
+}
+
+impl<T> UnsafePlaceholder<T> {
+    pub fn new() -> Self {
+        Self {
+            value: UnsafeCell::new(None),
+        }
+    }
+
+    pub fn set(&self, new_value: T) {
+        unsafe {
+            (&mut (*self.value.get())).replace(new_value);
+        }
+    }
+
+    pub fn get(&self) -> Option<T> {
+        unsafe { (&mut (*self.value.get())).take() }
+    }
+}
+
+unsafe impl<T> Send for UnsafePlaceholder<T> {}
+
+unsafe impl<T> Sync for UnsafePlaceholder<T> {}
+
+pub(self) struct Upload {
+    filepath: Option<String>,
+    content_rx: Option<mpsc::Receiver<(BytesMut, usize)>>,
+    thread_pool: Option<Arc<ThreadPool>>,
+    send_future: Option<BoxFuture<'static, anyhow::Result<()>>>,
+    sent: bool,
+    task_status: Arc<AtomicBool>,
+}
+
+impl Future for Upload {
+    type Output = anyhow::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.send_future.is_none() {
+            let waker = cx.waker().clone();
+            let status = self.task_status.clone();
+            let thread_pool = self.thread_pool.take().unwrap();
+            let filepath = self.filepath.take().unwrap();
+            let mut content_rx = self.content_rx.take().unwrap();
+            let future = async move {
+                thread_pool
+                    .execute_async(
+                        move || {
+                            let mut file = OpenOptions::new()
+                                .write(true)
+                                .append(true)
+                                .open(filepath.as_str())
+                                .unwrap();
+                            loop {
+                                match content_rx.blocking_recv() {
+                                    Some((content, n)) => {
+                                        if let Err(e) = file.write_all(&content[..n]) {
+                                            error!("write content error: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        break;
+                                    }
+                                }
+                            }
+                        },
+                        move || {
+                            status.store(true, Ordering::Release);
+                            waker.wake();
+                        },
+                    )
+                    .await
+            };
+            self.send_future = Some(Box::pin(future));
+        }
+        if !self.sent {
+            match self.send_future.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Ready(Ok(_)) => {
+                    self.sent = true;
+                }
+                Poll::Ready(Err(e)) => {
+                    error!("download error: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+        if self.task_status.load(Ordering::Acquire) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 pub(self) struct Download {

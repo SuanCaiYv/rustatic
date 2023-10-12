@@ -1,4 +1,3 @@
-use std::{sync::mpsc, thread, time::Duration};
 use std::fs::OpenOptions;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsFd;
@@ -33,20 +32,9 @@ fn main() {
         .with_max_level(Level::DEBUG)
         .try_init()
         .unwrap();
-    let pool = pool::ThreadPool::new(24, 180, 400);
-    core_affinity::set_for_current(core_affinity::CoreId { id: 0 });
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    let bind_addr: SocketAddr = "0.0.0.0:8190".parse().unwrap();
-    let bind_addr = bind_addr.into();
-    socket.bind(&bind_addr).unwrap();
-    socket.listen(128).unwrap();
-    let listener: TcpListener = socket.into();
-    loop {
-        let (stream, _) = listener.accept().unwrap();
-        pool.execute(move || {
-            handle(stream);
-        }, || {});
-    }
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(1).unwrap();
+    println!("{:?}", tx.try_send(1));
 }
 
 // 40ms
