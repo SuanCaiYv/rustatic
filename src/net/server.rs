@@ -17,7 +17,9 @@ use base64::Engine;
 use bytes::BytesMut;
 use dashmap::DashMap;
 use futures::{future::BoxFuture, Future};
+use hmac::{Hmac, Mac};
 use nix::sys::sendfile;
+use sha2::Sha256;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}},
@@ -26,17 +28,21 @@ use tokio::{
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tracing::error;
 use uuid::Uuid;
-use crate::db::get_user_ops;
+use crate::db::{get_metadata_ops, get_user_ops};
+use crate::db::metadata::Metadata;
+use crate::db::user::User;
 
 use crate::pool::ThreadPool;
 
 pub(self) const ALPN_RUSTATIC: &[&[u8]] = &[b"rustatic"];
 
+type HmacSha256 = Hmac<Sha256>;
+
 pub(crate) struct ServerConfig {
-    data_port: u16,
-    ctrl_port: u16,
-    cert: rustls::Certificate,
-    key: rustls::PrivateKey,
+    pub(crate) data_port: u16,
+    pub(crate) ctrl_port: u16,
+    pub(crate) cert: rustls::Certificate,
+    pub(crate) key: rustls::PrivateKey,
 }
 
 pub(crate) struct Server {
@@ -110,7 +116,7 @@ impl Server {
 
         while let Ok((stream, _)) = ctrl_listener.accept().await {
             let stream = acceptor.accept(stream).await?;
-            let mut request = Request::new(stream);
+            let mut request = Request::new(stream, data_conn_map.clone());
             tokio::spawn(async move {
                 if let Err(e) = request.handle().await {
                     error!("request handle error: {}", e);
@@ -123,11 +129,12 @@ impl Server {
 
 pub(self) struct Request {
     stream: TlsStream<TcpStream>,
+    cmd_map: Arc<DashMap<String, mpsc::Sender<Cmd>>>,
 }
 
 impl Request {
-    pub(self) fn new(stream: TlsStream<TcpStream>) -> Self {
-        Self { stream }
+    pub(self) fn new(stream: TlsStream<TcpStream>, cmd_map: Arc<DashMap<String, mpsc::Sender<Cmd>>>) -> Self {
+        Self { stream, cmd_map }
     }
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
@@ -186,8 +193,116 @@ impl Request {
                     let session_id = engine.encode(uuid);
                     self.stream.write_all(session_id.as_bytes()).await?;
                 }
-                3 => {}
-                4 => {}
+                3 => {
+                    let params = match serde_json::from_slice::<serde_json::Value>(content) {
+                        Ok(entry) => {
+                            let entry = match entry.as_object() {
+                                Some(e) => e,
+                                None => {
+                                    error!("parse request error: not a json object");
+                                    return Err(anyhow!("not a json object"));
+                                }
+                            };
+                            (
+                                entry.get("session_id").unwrap().as_str().unwrap().to_owned(),
+                                entry.get("filename").unwrap().as_str().unwrap().to_owned(),
+                                entry.get("size").unwrap().as_i64().unwrap(),
+                                entry.get("create_at").unwrap().as_i64().unwrap().to_owned(),
+                                entry.get("update_at").unwrap().as_i64().unwrap().to_owned(),
+                            )
+                        }
+                        Err(e) => {
+                            error!("parse request error: {}", e);
+                            return Err(anyhow!("parse request error"));
+                        }
+                    };
+                    let uuid = Uuid::new_v4().to_string();
+                    let engine = base64::engine::GeneralPurpose::new(
+                        &base64::alphabet::URL_SAFE,
+                        base64::engine::general_purpose::NO_PAD,
+                    );
+                    let link = engine.encode(uuid);
+                    let (session_id, filename, size, ..) = params;
+                    let filepath = format!("/Users/joker/RustProjects/rustatic/data/{}", filename);
+                    let metadata = Metadata {
+                        id: 0,
+                        filename: filename.clone(),
+                        owner: curr_user.clone().unwrap(),
+                        link: link.clone(),
+                        size,
+                        sha256: "".to_owned(),
+                        filepath: filepath.clone(), // set to link.<suffix>
+                        encrypt_key: "".to_owned(),
+                        permissions: "private".to_owned(),
+                        r#type: "".to_owned(),
+                        classification: "".to_owned(),
+                        create_time: chrono::Local::now().timestamp_millis(),
+                        update_time: chrono::Local::now().timestamp_millis(),
+                        delete_time: 0,
+                    };
+                    match get_metadata_ops().await.insert(metadata).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("insert metadata error: {}", e);
+                            break;
+                        }
+                    }
+                    match self.cmd_map.get(session_id.as_str()) {
+                        Some(cmd_tx) => {
+                            cmd_tx.send(Cmd::Upload(filepath, size as usize)).await?;
+                        }
+                        None => {
+                            error!("session id not found");
+                            break;
+                        }
+                    }
+                    self.stream.write_all(link.as_bytes()).await?;
+                }
+                4 => {
+                    let params = match serde_json::from_slice::<serde_json::Value>(content) {
+                        Ok(entry) => {
+                            let entry = match entry.as_object() {
+                                Some(e) => e,
+                                None => {
+                                    error!("parse request error: not a json object");
+                                    return Err(anyhow!("not a json object"));
+                                }
+                            };
+                            (
+                                entry.get("session_id").unwrap().as_str().unwrap().to_owned(),
+                                entry.get("link").unwrap().as_str().unwrap().to_owned(),
+                            )
+                        }
+                        Err(e) => {
+                            error!("parse request error: {}", e);
+                            return Err(anyhow!("parse request error"));
+                        }
+                    };
+                    let (session_id, link) = params;
+                    let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await {
+                        Ok(res) => match res {
+                            Some(v) => v,
+                            None => {
+                                error!("metadata not found");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("get metadata error: {}", e);
+                            break;
+                        }
+                    };
+                    match self.cmd_map.get(session_id.as_str()) {
+                        Some(cmd_tx) => {
+                            cmd_tx.send(Cmd::Download(metadata.filepath)).await?;
+                        }
+                        None => {
+                            error!("session id not found");
+                            break;
+                        }
+                    }
+                }
+                5 => {}
                 _ => {
                     error!("unknown op code: {}", op_code);
                     break;
@@ -222,29 +337,66 @@ impl Request {
 
     pub(self) async fn sign(params: (String, String)) -> anyhow::Result<()> {
         let (username, password) = params;
-        if get_user_ops().await.get(username).await?.is_some() {
+        if get_user_ops().await.get(username.clone()).await?.is_some() {
             return Err(anyhow!("user already exists"));
         }
+        let user_salt = Self::salt(12);
+        let mut mac: HmacSha256 = HmacSha256::new_from_slice(user_salt.as_bytes()).unwrap();
+        mac.update(password.as_bytes());
+        let res = mac.finalize().into_bytes();
+        let res_str = format!("{:X}", res);
+        let user = User {
+            id: 0,
+            username,
+            password: res_str,
+            salt: user_salt,
+            create_time: chrono::Local::now().timestamp_millis(),
+            update_time: chrono::Local::now().timestamp_millis(),
+            delete_time: 0,
+        };
+        get_user_ops().await.insert(user).await?;
         Ok(())
     }
 
     pub(self) async fn login(params: (String, String)) -> anyhow::Result<()> {
+        let (username, password) = params;
+        let user = match get_user_ops().await.get(username.clone()).await? {
+            Some(user) => user,
+            None => {
+                return Err(anyhow!("user not exists"));
+            }
+        };
+        let mut mac: HmacSha256 = HmacSha256::new_from_slice(user.salt.as_bytes()).unwrap();
+        mac.update(password.as_bytes());
+        let res = mac.finalize().into_bytes();
+        let res_str = format!("{:X}", res);
+        if res_str != user.password {
+            return Err(anyhow!("password not match"));
+        }
         Ok(())
+    }
+
+    pub(self) fn salt(length: usize) -> String {
+        let length = if length > 32 { 32 } else { length };
+        let string = Uuid::new_v4().to_string().replace("-", "M");
+        String::from_utf8_lossy(&string.as_bytes()[0..length])
+            .to_string()
+            .to_uppercase()
     }
 }
 
-pub(self) struct DataConnection<'a> {
+pub(self) struct DataConnection {
     reader: Option<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     raw_fd: RawFd,
-    cmd_rx: mpsc::Receiver<Cmd<'a>>,
+    cmd_rx: mpsc::Receiver<Cmd>,
     thread_pool: Arc<ThreadPool>,
 }
 
-impl<'a> DataConnection<'a> {
+impl DataConnection {
     pub(self) fn new(
         stream: TcpStream,
-        cmd_rx: mpsc::Receiver<Cmd<'a>>,
+        cmd_rx: mpsc::Receiver<Cmd>,
         thread_pool: Arc<ThreadPool>,
     ) -> Self {
         let raw_fd = stream.as_raw_fd();
@@ -266,8 +418,8 @@ impl<'a> DataConnection<'a> {
         loop {
             match self.cmd_rx.recv().await {
                 Some(cmd) => match cmd {
-                    Cmd::Upload(req) => self.upload("", 0).await?,
-                    Cmd::Download(req) => self.download("").await?,
+                    Cmd::Upload(filename, size) => self.upload(filename.as_str(), size).await?,
+                    Cmd::Download(filename) => self.download(filename.as_str()).await?,
                 },
                 None => break,
             }
@@ -337,6 +489,24 @@ impl<'a> DataConnection<'a> {
             .await?;
         Ok(())
     }
+
+    pub(self) async fn download_directly(&mut self, filepath: &str) -> anyhow::Result<()> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(filepath)
+            .await
+            .unwrap();
+        let mut buffer = BytesMut::with_capacity(4096 * 4);
+        loop {
+            let n = file.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            self.writer.write_all(&buffer[..n]).await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -350,9 +520,9 @@ impl AsFd for UnsafeFD {
     }
 }
 
-pub(self) enum Cmd<'a> {
-    Upload(&'a [u8]),
-    Download(&'a [u8]),
+pub(self) enum Cmd {
+    Upload(String, usize),
+    Download(String),
 }
 
 pub(super) struct UnsafePlaceholder<T> {
@@ -404,6 +574,12 @@ impl Future for Upload {
                 thread_pool
                     .execute_async(
                         move || {
+                            _ = std::fs::create_dir_all(std::path::Path::new(filepath.as_str())
+                                .parent()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                            );
                             let mut file = OpenOptions::new()
                                 .write(true)
                                 .append(true)

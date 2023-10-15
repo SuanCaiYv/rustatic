@@ -11,25 +11,29 @@ pub(self) const DB_CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS metadata (
     filepath          TEXT,
     encrypt_key       TEXT,
     permissions       TEXT,
+    type              TEXT,
+    classification    TEXT,
     create_time       INTEGER,
     update_time       INTEGER
     delete_time       INTEGER
 )";
 
 pub(crate) struct Metadata {
-    id: i64,
-    filename: String,
-    owner: String,
-    link: String,
-    size: i64,
-    sha256: String,
-    filepath: String,
-    encrypt_key: String,
+    pub(crate) id: i64,
+    pub(crate) filename: String,
+    pub(crate) owner: String,
+    pub(crate) link: String,
+    pub(crate) size: i64,
+    pub(crate) sha256: String,
+    pub(crate) filepath: String,
+    pub(crate) encrypt_key: String,
     /// private, public, link-limit
-    permissions: String,
-    create_time: i64,
-    update_time: i64,
-    delete_time: i64,
+    pub(crate) permissions: String,
+    pub(crate) r#type: String,
+    pub(crate) classification: String,
+    pub(crate) create_time: i64,
+    pub(crate) update_time: i64,
+    pub(crate) delete_time: i64,
 }
 
 pub(crate) struct MetadataDB {
@@ -62,7 +66,7 @@ impl MetadataDB {
             .call(move |conn| {
                 let mut stmt = conn
                     .prepare(
-                        "INSERT INTO metadata (filename, owner, link, size, sha256, filepath, encrypt_key, permissions, create_time, update_time, delete_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        "INSERT INTO metadata (filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, create_time, update_time, delete_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     )
                     .unwrap();
                 stmt.execute(params![
@@ -74,6 +78,8 @@ impl MetadataDB {
                     metadata.filepath,
                     metadata.encrypt_key,
                     metadata.permissions,
+                    metadata.r#type,
+                    metadata.classification,
                     metadata.create_time,
                     metadata.update_time,
                     metadata.delete_time
@@ -91,7 +97,7 @@ impl MetadataDB {
             .call(move |conn| {
                 let mut stmt = conn
                     .prepare(
-                        "UPDATE metadata SET filename = ?1, owner = ?2, link = ?3, size = ?4, sha256 = ?5, filepath = ?6, encrypt_key = ?7, permissions = ?8, create_time = ?9, update_time = ?10, delete_time = ?11 WHERE id = ?12",
+                        "UPDATE metadata SET filename = ?1, owner = ?2, link = ?3, size = ?4, sha256 = ?5, filepath = ?6, encrypt_key = ?7, permissions = ?8, type = ?9, classification = ?10, create_time = ?11, update_time = ?12, delete_time = ?13 WHERE id = ?14",
                     )
                     .unwrap();
                 stmt.execute(params![
@@ -138,7 +144,7 @@ impl MetadataDB {
 
     pub(crate) async fn get(&self, id: i64) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT filename, owner, link, size, sha256, filepath, encrypt_key, permissions, create_time, update_time, delete_time FROM metadata WHERE id = ?1")?;
+            let mut statement = conn.prepare("SELECT filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, create_time, update_time, delete_time FROM metadata WHERE id = ?1")?;
             let mut res = statement
                 .query_map(params![id], |row| {
                     let metadata = Metadata {
@@ -151,9 +157,11 @@ impl MetadataDB {
                         filepath: row.get(5)?,
                         encrypt_key: row.get(6)?,
                         permissions: row.get(7)?,
-                        create_time: row.get(8)?,
-                        update_time: row.get(9)?,
-                        delete_time: row.get(10)?,
+                        r#type: row.get(8)?,
+                        classification: row.get(9)?,
+                        create_time: row.get(10)?,
+                        update_time: row.get(11)?,
+                        delete_time: row.get(12)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?
@@ -169,7 +177,7 @@ impl MetadataDB {
 
     pub(crate) async fn get_by_link(&self, link: String) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, create_time, update_time, delete_time FROM metadata WHERE link = ?1")?;
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, create_time, update_time, delete_time FROM metadata WHERE link = ?1")?;
             let mut res = statement
                 .query_map(params![link], |row| {
                     let metadata = Metadata {
@@ -182,9 +190,11 @@ impl MetadataDB {
                         filepath: row.get(6)?,
                         encrypt_key: row.get(7)?,
                         permissions: row.get(8)?,
-                        create_time: row.get(9)?,
-                        update_time: row.get(10)?,
-                        delete_time: row.get(11)?,
+                        r#type: row.get(9)?,
+                        classification: row.get(10)?,
+                        create_time: row.get(11)?,
+                        update_time: row.get(12)?,
+                        delete_time: row.get(13)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?

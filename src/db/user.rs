@@ -12,13 +12,13 @@ pub(self) const DB_CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS user (
 )";
 
 pub(crate) struct User {
-    id: i64,
-    username: String,
-    password: String,
-    salt: String,
-    create_time: i64,
-    update_time: i64,
-    delete_time: i64,
+    pub(crate) id: i64,
+    pub(crate) username: String,
+    pub(crate) password: String,
+    pub(crate) salt: String,
+    pub(crate) create_time: i64,
+    pub(crate) update_time: i64,
+    pub(crate) delete_time: i64,
 }
 
 pub(crate) struct UserDB {

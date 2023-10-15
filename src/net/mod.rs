@@ -1,1 +1,1 @@
-mod server;
+pub(crate) mod server;

@@ -1,0 +1,152 @@
+use std::{
+    fs::OpenOptions,
+    io::{Seek, SeekFrom, Read},
+    net::TcpListener,
+    os::{fd::AsFd, unix::prelude::FileExt},
+    time::{SystemTime, UNIX_EPOCH}, num::NonZeroUsize,
+};
+
+use ahash::AHashMap;
+use nix::sys::{sendfile, mman::{self, ProtFlags, MapFlags}};
+use polling::{Event, Events, Poller};
+
+fn main() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:8190")?;
+    listener.set_nonblocking(true)?;
+    let bind_key = 1;
+    let poller = Poller::new()?;
+    unsafe { poller.add(&listener, Event::readable(bind_key)) }?;
+
+    let mut events = Events::new();
+    let mut connections = AHashMap::new();
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open("/home/ubuntu/OrbStack.dmg")?;
+    let size = file.seek(SeekFrom::End(0))? as usize;
+    let mut offset: usize = 0;
+    println!("size: {}", size);
+
+    let mut total = 0;
+
+    // let t = timestamp();
+    // let ptr = unsafe {
+    //     mman::mmap(
+    //         None,
+    //         NonZeroUsize::new_unchecked(size),
+    //         ProtFlags::PROT_READ,
+    //         MapFlags::MAP_PRIVATE,
+    //         Some(file.as_fd()),
+    //         0,
+    //     )
+    // }?;
+    // let arr =
+    //     unsafe { std::slice::from_raw_parts::<u8>(ptr as *const u8, size) };
+    // for i in 0..size {
+    //     let dummy = arr[i];
+    // }
+    // println!("read all bytes cost {}", timestamp() - t);
+
+    loop {
+        events.clear();
+        poller.wait(&mut events, None)?;
+
+        for event in events.iter() {
+            if event.key == bind_key {
+                let (socket, addr) = listener.accept()?;
+                poller.modify(&listener, Event::readable(event.key))?;
+                println!("accept: {}", addr.to_string());
+                socket.set_nonblocking(true)?;
+                let key = timestamp() as usize;
+                unsafe { poller.add(&socket, Event::all(key)) }?;
+                connections.insert(key, socket);
+                offset = 0;
+            } else {
+                let socket = connections.get_mut(&event.key).unwrap();
+                if event.writable {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if offset >= size {
+                            println!("download finished {} in {}", offset, total);
+                            socket.shutdown(std::net::Shutdown::Both)?;
+                            poller.delete(&socket)?;
+                            return Ok(());
+                        }
+                        // let count: usize = 1024 * 4 * 16;
+                        // let truely_count = if offset + count > size as usize {
+                        //     size - offset
+                        // } else {
+                        //     count
+                        // } as usize;
+                        // let ptr = unsafe {
+                        //     match mman::mmap(
+                        //         None,
+                        //         NonZeroUsize::new_unchecked(count),
+                        //         ProtFlags::PROT_READ,
+                        //         MapFlags::MAP_PRIVATE,
+                        //         Some(file.as_fd()),
+                        //         offset as i64,
+                        //     ) {
+                        //         Ok(ptr) => ptr,
+                        //         Err(e) => {
+                        //             println!("mmap error: {}", e.to_string());
+                        //             break;
+                        //         }
+                        //     }
+                        // };
+                        // let arr =
+                        //     unsafe { std::slice::from_raw_parts::<u8>(ptr as *const u8, count) };
+                        // for i in 0..truely_count {
+                        //     let _dummy = arr[i];
+                        // }
+                        let count: usize = size - offset;
+                        let mut offset_ = offset as i64;
+                        let t = timestamp();
+                        let res = sendfile::sendfile(
+                            socket.as_fd(),
+                            file.as_fd(),
+                            Some(&mut offset_),
+                            count,
+                        );
+                        total += timestamp() - t;
+                        match res {
+                            Ok(n_sent) => {
+                                // println!("sent {} bytes", n_sent);
+                                offset += n_sent;
+                            }
+                            Err(e) => {
+                                println!("Error: {}", e.desc());
+                                break;
+                            }
+                        };
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let (res, num) = sendfile::sendfile(
+                            file_fd,
+                            socket.as_fd(),
+                            offset as i64,
+                            Some(size as i64),
+                            None,
+                            None,
+                        );
+                        if res.is_err() {
+                            println!("download error: {}", res.unwrap_err().desc());
+                        }
+                        n = num as usize;
+                    }
+                    poller.modify(&socket, Event::all(event.key))?;
+                }
+            }
+        }
+    }
+}
+
+pub fn timestamp() -> u128 {
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    let micros = since_the_epoch.as_micros() as u128;
+    micros
+}

@@ -1,14 +1,17 @@
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsFd;
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use nix::sys::sendfile;
-use socket2::{Domain, Socket, Type};
+pub use tracing::{Level};
+use tracing::error;
+use crate::net::server::{Server, ServerConfig};
 
-use tracing::{error, Level};
-
-mod pool;
-mod net;
 mod db;
+mod net;
+mod pool;
 
 // #[tokio::main]
 // async fn main() {
@@ -21,7 +24,31 @@ mod db;
 //     }
 // }
 
-fn main() {
+// #[tokio::main]
+// async fn main() -> anyhow::Result<()> {
+//     tracing_subscriber::fmt()
+//         .event_format(
+//             tracing_subscriber::fmt::format()
+//                 .with_line_number(true)
+//                 .with_level(true)
+//                 .with_target(true),
+//         )
+//         .with_max_level(Level::INFO)
+//         .try_init()
+//         .unwrap();
+//
+//     let server_config = ServerConfig {
+//         ctrl_port: 8190,
+//         data_port: 8191,
+//         cert: rustls::Certificate(include_bytes!("/Users/joker/RustProjects/prim/server/cert/localhost-server.crt.der").to_vec()),
+//         key: rustls::PrivateKey(include_bytes!("/Users/joker/RustProjects/prim/server/cert/localhost-server.key.der").to_vec()),
+//     };
+//     Server::new(server_config).run().await?;
+//     Ok(())
+// }
+
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .event_format(
             tracing_subscriber::fmt::format()
@@ -29,12 +56,42 @@ fn main() {
                 .with_level(true)
                 .with_target(true),
         )
-        .with_max_level(Level::DEBUG)
+        .with_max_level(Level::INFO)
         .try_init()
         .unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.try_send(1).unwrap();
-    println!("{:?}", tx.try_send(1));
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open("/Users/joker/Downloads/Adobe_Lightroom_Classic_2023_v12_4.dmg")
+        .unwrap();
+    let mut size = file.metadata().unwrap().len() as i64;
+    let mut buffer = vec![0; 1024 * 1024 * 8];
+    let mut temp = vec![0; 1024 * 1024 * 8];
+    for i in 0..1024 * 1024 * 8 {
+        buffer[i] = i as u8;
+    }
+    let t = timestamp();
+    for _ in 0..256 {
+        for i in 0..1024 * 1024 * 8 {
+            temp[i] = buffer[i];
+        }
+    }
+    println!("time: {}", (timestamp() - t) / 1000);
+    let listener = TcpListener::bind("0.0.0.0:8190").unwrap();
+    loop {
+        let (stream, _) = listener.accept().unwrap();
+        thread::spawn(move || {
+            handle(stream);
+        });
+    }
+}
+
+pub fn timestamp() -> u64 {
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    let micros = since_the_epoch.as_micros() as u64;
+    micros
 }
 
 // 40ms
@@ -42,22 +99,24 @@ fn handle(stream: TcpStream) {
     core_affinity::set_for_current(core_affinity::CoreId { id: 1 });
     let file = OpenOptions::new()
         .read(true)
-        .open("/Users/joker/Downloads/VSCode-darwin-arm64.zip")
+        .open("/Users/joker/Downloads/Adobe_Lightroom_Classic_2023_v12_4.dmg")
         .unwrap();
     let mut size = file.metadata().unwrap().len() as i64;
+    println!("size: {}", size);
     let file_fd = file.as_fd();
     let mut offset = 0;
     loop {
+        let t = timestamp();
         let (res, n) = sendfile::sendfile(file_fd, stream.as_fd(), offset, Some(size), None, None);
         if res.is_err() {
-            error!("download error: {}", res.unwrap_err());
-            break;
+            error!("download error: {} {}", res.unwrap_err(), n);
         }
         if size == 0 {
             break;
         }
         offset += n;
         size -= n;
+        println!("time: {} remain: {}", (timestamp() - t) / 1000, size);
     }
 }
 
