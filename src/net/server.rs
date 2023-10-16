@@ -509,17 +509,6 @@ impl DataConnection {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(self) struct UnsafeFD {
-    fd: RawFd,
-}
-
-impl AsFd for UnsafeFD {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(self.fd) }
-    }
-}
-
 pub(self) enum Cmd {
     Upload(String, usize),
     Download(String),
