@@ -1,6 +1,5 @@
 use std::{fs::OpenOptions, io::Write, sync::Arc};
 
-use bytes::BytesMut;
 use tokio::{io::AsyncReadExt, net::tcp::OwnedReadHalf, sync::mpsc};
 use tracing::error;
 
@@ -30,7 +29,7 @@ impl<'a> Upload<'a> {
 
     pub(super) async fn run(&mut self) -> anyhow::Result<()> {
         let filepath = self.filepath.clone();
-        let (tx, mut rx) = mpsc::channel::<(BytesMut, usize)>(1);
+        let (tx, mut rx) = mpsc::channel::<(Arc<Vec<u8>>, usize)>(1);
         let pool = self.thread_pool.clone();
 
         tokio::spawn(async move {
@@ -72,12 +71,15 @@ impl<'a> Upload<'a> {
             }
         });
 
-        let buffer1 = BytesMut::with_capacity(4096 * 4);
-        let buffer2 = BytesMut::with_capacity(4096 * 4);
-        let mut buffer = buffer1.clone();
-        let mut flag = false;
+        let buffer1 = Arc::new(vec![0u8; 1024 * 16]);
+        let buffer2 = Arc::new(vec![0u8; 1024 * 16]);
+        let buffer3 = Arc::new(vec![0u8; 1024 * 16]);
+        let mut buffer_arr = [buffer1, buffer2, buffer3];
+        let mut idx: usize = 0;
         while self.size > 0 {
-            let n = match self.read_stream.read(&mut buffer).await {
+            let buffer = Arc::get_mut(&mut buffer_arr[idx % 3]).unwrap();
+            let buffer = buffer.as_mut_slice();
+            let n = match self.read_stream.read(buffer).await {
                 Ok(n) => n,
                 Err(e) => {
                     error!("read content error: {}", e);
@@ -88,17 +90,11 @@ impl<'a> Upload<'a> {
                 break;
             }
             self.size -= n;
-            if let Err(e) = tx.send((buffer.clone(), n)).await {
+            if let Err(e) = tx.send((buffer_arr[idx % 3].clone(), n)).await {
                 error!("disk operation error: {}", e);
                 break;
             }
-            // to handle channel cache.
-            buffer = if flag {
-                buffer1.clone()
-            } else {
-                buffer2.clone()
-            };
-            flag = !flag;
+            idx += 1;
         }
         Ok(())
     }

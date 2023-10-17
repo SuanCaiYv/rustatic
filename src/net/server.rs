@@ -20,7 +20,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -39,6 +39,7 @@ pub(crate) struct ServerConfig {
     pub(crate) ctrl_port: u16,
     pub(crate) cert: rustls::Certificate,
     pub(crate) key: rustls::PrivateKey,
+    pub(crate) root_folder: String,
 }
 
 pub(crate) struct Server {
@@ -58,6 +59,7 @@ impl Server {
             ctrl_port,
             cert,
             key,
+            root_folder,
         } = self.config.take().unwrap();
 
         let mut rustls_config = rustls::ServerConfig::builder()
@@ -113,9 +115,10 @@ impl Server {
         });
 
         info!("ctrl listener started");
+        let root_folder: &'static str = Box::leak(root_folder.into_boxed_str());
         while let Ok((stream, _)) = ctrl_listener.accept().await {
             let stream = acceptor.accept(stream).await?;
-            let mut request = Request::new(stream, data_conn_map.clone());
+            let mut request = Request::new(stream, data_conn_map.clone(), root_folder);
             tokio::spawn(async move {
                 if let Err(e) = request.handle().await {
                     error!("request handle error: {}", e);
@@ -129,14 +132,16 @@ impl Server {
 pub(self) struct Request {
     stream: TlsStream<TcpStream>,
     cmd_map: Arc<DashMap<String, mpsc::Sender<Cmd>>>,
+    root_folder: &'static str,
 }
 
 impl Request {
     pub(self) fn new(
         stream: TlsStream<TcpStream>,
         cmd_map: Arc<DashMap<String, mpsc::Sender<Cmd>>>,
+        root_folder: &'static str,
     ) -> Self {
-        Self { stream, cmd_map }
+        Self { stream, cmd_map, root_folder }
     }
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
@@ -147,7 +152,7 @@ impl Request {
             let op_code = match self.stream.read_u16().await {
                 Ok(code) => code,
                 Err(e) => {
-                    error!("read request error: {}", e);
+                    warn!("read request error: {}", e);
                     break;
                 }
             };
@@ -246,7 +251,8 @@ impl Request {
                     let link = engine.encode(uuid);
                     let (session_id, filename, size, ..) = params;
                     let filepath = format!(
-                        "/Users/joker/RustProjects/rustatic/data/{}/{}",
+                        "{}/{}/{}",
+                        self.root_folder,
                         curr_user.as_ref().unwrap(),
                         filename
                     );
@@ -302,9 +308,11 @@ impl Request {
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
                             cmd_tx.send(Cmd::Download(metadata.filepath)).await?;
+                            self.stream.write_all(format!("ok {}\n", metadata.filename).as_bytes()).await?;
                         }
                         None => {
                             error!("session id not found");
+                            self.stream.write_all(format!("err {}\n", "bad session_id").as_bytes()).await?;
                             break;
                         }
                     }
