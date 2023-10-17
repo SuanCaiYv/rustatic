@@ -303,6 +303,7 @@ impl ThreadPool {
 
     /// if the cache queue for task is full, and number of threads reach the max_size,
     /// then the call of this method will block until the cache queue is not full.
+    #[allow(unused)]
     pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
         where
             F: FnOnce() -> () + Send + Sync + 'static,

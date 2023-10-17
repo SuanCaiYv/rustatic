@@ -1,3 +1,9 @@
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    path::PathBuf,
+};
+
 use rusqlite::params;
 use tokio_rusqlite::Connection;
 
@@ -7,11 +13,12 @@ pub(self) const DB_CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS user (
     password          TEXT,
     salt              TEXT,
     create_time       INTEGER,
-    update_time       INTEGER
+    update_time       INTEGER,
     delete_time       INTEGER
 )";
 
 pub(crate) struct User {
+    #[allow(unused)]
     pub(crate) id: i64,
     pub(crate) username: String,
     pub(crate) password: String,
@@ -27,30 +34,39 @@ pub(crate) struct UserDB {
 
 impl UserDB {
     pub(crate) async fn new() -> anyhow::Result<Self> {
-        let path = if cfg!(unix) {
-            "/usr/local/rustatic/user.db"
+        let path = if cfg!(unix) || cfg!(macos) {
+            let home = env::var("HOME").expect("HOME not set");
+            format!("{}/rustatic/user.sqlite", home)
         } else if cfg!(windows) {
-            "C:\\Program Files\\Rustatic\\user.db"
+            "C:\\Program Files\\Rustatic\\user.db".to_owned()
         } else {
             panic!("unsupported platform");
         };
-        let conn = Connection::open(path).await?;
-        conn
-            .call(|conn| {
-                let mut stmt = conn.prepare(DB_CREATE_TABLE).unwrap();
-                stmt.execute(params![]).unwrap();
-                Ok::<(), rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        };
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&path)?;
+        let conn = Connection::open(path).await.unwrap();
+        conn.call(|conn| {
+            let mut stmt = conn.prepare(DB_CREATE_TABLE)?;
+            stmt.execute(params![]).unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
         Ok(Self { conn })
     }
-    
+
     pub(crate) async fn insert(&self, user: User) -> anyhow::Result<()> {
         self.conn
             .call(move |conn| {
                 let mut stmt = conn
-                    .prepare("INSERT INTO user (username, password, salt, create_time, update_time, delete_time) VALUES (?, ?, ?, ?, ?, ?)")
+                    .prepare("INSERT INTO user (username, password, salt, create_time, update_time, delete_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
                     .unwrap();
                 stmt.execute(params![
                     user.username,
@@ -67,7 +83,7 @@ impl UserDB {
             .unwrap();
         Ok(())
     }
-    
+
     pub(crate) async fn get(&self, username: String) -> anyhow::Result<Option<User>> {
         let res = self.conn.call(move |conn| {
             let mut statement = conn.prepare("SELECT id, username, password, salt, create_time, update_time, delete_time FROM user WHERE username = ?1")?;

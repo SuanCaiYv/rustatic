@@ -773,6 +773,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "libsqlite3-sys",
  "nix",
  "priority-queue",
  "rbtree",

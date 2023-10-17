@@ -1,3 +1,9 @@
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    path::PathBuf,
+};
+
 use rusqlite::params;
 use tokio_rusqlite::Connection;
 
@@ -14,11 +20,12 @@ pub(self) const DB_CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS metadata (
     type              TEXT,
     classification    TEXT,
     create_time       INTEGER,
-    update_time       INTEGER
+    update_time       INTEGER,
     delete_time       INTEGER
 )";
 
 pub(crate) struct Metadata {
+    #[allow(unused)]
     pub(crate) id: i64,
     pub(crate) filename: String,
     pub(crate) owner: String,
@@ -43,21 +50,30 @@ pub(crate) struct MetadataDB {
 impl MetadataDB {
     pub(crate) async fn new() -> anyhow::Result<Self> {
         let path = if cfg!(unix) {
-            "/usr/local/rustatic/metadata.db"
+            let home = env::var("HOME").expect("HOME not set");
+            format!("{}/rustatic/metadata.sqlite", home)
         } else if cfg!(windows) {
-            "C:\\Program Files\\Rustatic\\metadata.db"
+            "C:\\Program Files\\Rustatic\\metadata.db".to_owned()
         } else {
             panic!("unsupported platform");
         };
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        };
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&path)?;
         let conn = Connection::open(path).await?;
-        conn
-            .call(|conn| {
-                let mut stmt = conn.prepare(DB_CREATE_TABLE).unwrap();
-                stmt.execute(params![]).unwrap();
-                Ok::<(), rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
+        conn.call(|conn| {
+            let mut stmt = conn.prepare(DB_CREATE_TABLE).unwrap();
+            stmt.execute(params![]).unwrap();
+            Ok::<(), rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
         Ok(Self { conn })
     }
 
@@ -92,6 +108,7 @@ impl MetadataDB {
         Ok(())
     }
 
+    #[allow(unused)]
     pub(crate) async fn update(&self, metadata: Metadata) -> anyhow::Result<()> {
         self.conn
             .call(move |conn| {
@@ -122,19 +139,15 @@ impl MetadataDB {
         Ok(())
     }
 
+    #[allow(unused)]
     pub(crate) async fn delete(&self, id: i64) -> anyhow::Result<()> {
         self.conn
             .call(move |conn| {
                 let mut stmt = conn
-                    .prepare(
-                        "UPDATE metadata SET delete_time = ?1 WHERE id = ?2",
-                    )
+                    .prepare("UPDATE metadata SET delete_time = ?1 WHERE id = ?2")
                     .unwrap();
-                stmt.execute(params![
-                    chrono::Local::now().timestamp(),
-                    id
-                ])
-                .unwrap();
+                stmt.execute(params![chrono::Local::now().timestamp(), id])
+                    .unwrap();
                 Ok::<(), rusqlite::Error>(())
             })
             .await
@@ -142,6 +155,7 @@ impl MetadataDB {
         Ok(())
     }
 
+    #[allow(unused)]
     pub(crate) async fn get(&self, id: i64) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
             let mut statement = conn.prepare("SELECT filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, create_time, update_time, delete_time FROM metadata WHERE id = ?1")?;

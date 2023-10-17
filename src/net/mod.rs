@@ -2,9 +2,10 @@ use std::os::fd::{AsFd, BorrowedFd, RawFd};
 
 pub(crate) mod server;
 pub(self) mod download;
+pub(self) mod upload;
 
 #[derive(Clone, Copy)]
-pub(self) struct UnsafeFD {
+pub(super) struct UnsafeFD {
     fd: RawFd,
 }
 
