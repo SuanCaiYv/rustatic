@@ -1,4 +1,4 @@
-use std::{fs::OpenOptions, num::NonZeroUsize, os::fd::AsRawFd, sync::Arc, io::Seek};
+use std::{fs::{OpenOptions, File}, num::NonZeroUsize, os::fd::AsRawFd, sync::Arc};
 
 use anyhow::anyhow;
 use nix::{
@@ -38,83 +38,110 @@ impl<'a> Download<'a> {
     }
 
     pub(super) async fn run(&mut self) -> anyhow::Result<()> {
-        // let (content_tx, mut content_rx) = mpsc::channel(64);
-        let mut download_helper = DownloadHelper::new(
-            self.filepath.clone(),
-            self.socket_fd,
-            4096 * 64,
-            self.write_stream,
-        );
-        download_helper.run().await?;
-        // self.thread_pool
-        //     .execute_async(
-        //         move || {
-        //             _ = download_helper.run().await;
-        //         },
-        //         || {},
-        //     )
-        //     .await?;
-        // while let Some(mut preload) = content_rx.recv().await {
-        //     while preload.size > 0 {
-        //         self.write_stream.writable().await?;
-        //         let (res, n) = sendfile::sendfile(
-        //             preload.fd,
-        //             self.socket_fd,
-        //             preload.offset as i64,
-        //             Some(preload.size as i64),
-        //             None,
-        //             None,
-        //         );
-        //         if let Err(e) = res {
-        //             error!("failed to sendfile: {}", e);
-        //             return Err(anyhow!("failed to sendfile: {}", e));
-        //         }
-        //         let n = n as usize;
-        //         if n == 0 {
-        //             break;
-        //         }
-        //         preload.size -= n;
-        //         preload.offset += n;
-        //     }
-        // }
+        let (content_tx, mut content_rx) = mpsc::channel(64);
+        let mut download_helper = DownloadHelper::new(self.filepath.clone(), 4096 * 64, content_tx);
+        self.thread_pool
+            .execute_async(
+                move || {
+                    _ = download_helper.run();
+                },
+                || {},
+            )
+            .await?;
+        while let Some(entry) = content_rx.recv().await {
+            let mut preload = match entry {
+                PreloadOrFile::P(preload) => preload,
+                PreloadOrFile::F(_file) => {
+                    break;
+                }
+            };
+            let mut preload_size = preload.size;
+            while preload_size > 0 {
+                self.write_stream.writable().await?;
+                #[cfg(target_os = "linux")]
+                    let n = {
+                    let res = sendfile::sendfile(
+                        socket.as_fd(),
+                        file.as_fd(),
+                        Some(&mut preload.offset),
+                        preload_size,
+                    );
+                    match res {
+                        Ok(n_sent) => n_sent,
+                        Err(e) => {
+                            error!("failed to sendfile: {}", e);
+                            return Err(anyhow!("failed to sendfile: {}", e));
+                        }
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                    let n = {
+                    let (res, n) = sendfile::sendfile(
+                        preload.fd,
+                        self.socket_fd,
+                        preload.offset as i64,
+                        Some(preload_size as i64),
+                        None,
+                        None,
+                    );
+                    if let Err(e) = res {
+                        if e == nix::errno::Errno::EAGAIN {
+                            // a bug on macos while using with writable()
+                            if n == 0 {
+                                tokio::time::sleep(std::time::Duration::from_micros(1)).await;
+                                continue;
+                            }
+                        } else {
+                            error!("failed to sendfile: {}", e);
+                            return Err(anyhow!("failed to sendfile: {}", e));
+                        }
+                    }
+                    n as usize
+                };
+                preload_size -= n;
+                preload.offset += n;
+                if n == 0 || preload_size == 0 {
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 }
 
-pub(self) struct DownloadHelper<'a> {
+pub(self) struct DownloadHelper {
     filepath: String,
-    fd: UnsafeFD,
     buffer_size: usize,
-    write_stream: &'a mut OwnedWriteHalf,
-    // content_tx: mpsc::Sender<Preload>,
+    content_tx: mpsc::Sender<PreloadOrFile>,
 }
 
-impl<'a> DownloadHelper<'a> {
+impl DownloadHelper {
     pub(self) fn new(
         filepath: String,
-        fd: UnsafeFD,
         buffer_size: usize,
-        write_stream: &'a mut OwnedWriteHalf,
-        // content_tx: mpsc::Sender<Preload>,
+        content_tx: mpsc::Sender<PreloadOrFile>,
     ) -> Self {
         Self {
             filepath,
-            fd,
             buffer_size,
-            write_stream,
-            // content_tx,
+            content_tx,
         }
     }
 
-    pub(self) async fn run(&mut self) -> anyhow::Result<()> {
+    pub(self) fn run(&mut self) -> anyhow::Result<()> {
         let file = OpenOptions::new().read(true).open(self.filepath.as_str())?;
-        let file_len: usize = file.seek(std::io::SeekFrom::End(0)) as usize;
+        let file_len: usize = file.metadata()?.len() as usize;
         let file_fd = UnsafeFD {
             fd: file.as_raw_fd(),
         };
         let mut offset = 0;
-        while offset < self.buffer_size {
-            let mut preload = match Preload::new(file_fd, self.buffer_size, offset) {
+        while offset < file_len {
+            let len = if file_len - offset > self.buffer_size {
+                self.buffer_size
+            } else {
+                file_len - offset
+            };
+            let mut preload = match Preload::new(file_fd, len, offset) {
                 Err(e) => {
                     error!("failed to preload: {}", e);
                     return Err(anyhow!("failed to preload: {}", e));
@@ -122,32 +149,12 @@ impl<'a> DownloadHelper<'a> {
                 Ok(preload) => preload,
             };
             preload.load_data();
-            while preload.size > 0 {
-                self.write_stream.writable().await?;
-                let (res, n) = sendfile::sendfile(
-                    preload.fd,
-                    self.fd,
-                    preload.offset as i64,
-                    Some(preload.size as i64),
-                    None,
-                    None,
-                );
-                if let Err(e) = res {
-                    error!("failed to sendfile: {}", e);
-                    continue;
-                }
-                let n = n as usize;
-                if n == 0 {
-                    break;
-                }
-                preload.size -= n;
-                preload.offset += n;
+            if self.content_tx.blocking_send(PreloadOrFile::P(preload)).is_err() {
+                break;
             }
-            offset += self.buffer_size;
-            // if self.content_tx.blocking_send(preload).is_err() {
-            //     break;
-            // }
+            offset += len;
         }
+        self.content_tx.blocking_send(PreloadOrFile::F(file))?;
         Ok(())
     }
 }
@@ -204,8 +211,16 @@ impl Drop for Preload {
     fn drop(&mut self) {
         unsafe {
             if let Err(e) = mman::munmap(self.mmap_ptr as *mut u8 as *mut libc::c_void, self.size) {
-                error!("failed to unmap memory: {} {} {}", e, self.mmap_ptr, self.size)
+                error!(
+                    "failed to unmap memory: {} {} {}",
+                    e, self.mmap_ptr, self.size
+                )
             }
         }
     }
+}
+
+pub(self) enum PreloadOrFile {
+    P(Preload),
+    F(File),
 }
