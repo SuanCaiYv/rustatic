@@ -1,9 +1,4 @@
-use std::{
-    cell::UnsafeCell,
-    net::SocketAddr,
-    os::fd::{AsRawFd, RawFd},
-    sync::Arc,
-};
+use std::{cell::UnsafeCell, net::SocketAddr, sync::Arc};
 
 use anyhow::anyhow;
 use base64::Engine;
@@ -13,10 +8,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+    net::{TcpListener, TcpStream},
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
@@ -28,7 +20,7 @@ use crate::{
     pool::ThreadPool,
 };
 
-use super::{download::Download, upload::Upload, UnsafeFD};
+use super::{download::Download, upload::Upload};
 
 pub(self) const ALPN_RUSTATIC: &[&[u8]] = &[b"rustatic"];
 
@@ -141,7 +133,11 @@ impl Request {
         cmd_map: Arc<DashMap<String, mpsc::Sender<Cmd>>>,
         root_folder: &'static str,
     ) -> Self {
-        Self { stream, cmd_map, root_folder }
+        Self {
+            stream,
+            cmd_map,
+            root_folder,
+        }
     }
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
@@ -180,7 +176,9 @@ impl Request {
                     curr_user = Some(params.0.clone());
                     if let Err(e) = Self::sign(params).await {
                         error!("sign error: {}", e);
-                        self.stream.write_all(format!("err {}\n", e.to_string()).as_bytes()).await?;
+                        self.stream
+                            .write_all(format!("err {}\n", e.to_string()).as_bytes())
+                            .await?;
                         break;
                     }
                     let uuid = Uuid::new_v4().to_string();
@@ -189,7 +187,9 @@ impl Request {
                         base64::engine::general_purpose::NO_PAD,
                     );
                     let session_id = engine.encode(uuid);
-                    self.stream.write_all(format!("ok {}\n", session_id).as_bytes()).await?;
+                    self.stream
+                        .write_all(format!("ok {}\n", session_id).as_bytes())
+                        .await?;
                 }
                 2 => {
                     let params = Self::parse1(content)?;
@@ -203,7 +203,9 @@ impl Request {
                     }
                     if let Err(e) = Self::login(Self::parse1(content)?).await {
                         error!("login error: {}", e);
-                        self.stream.write_all(format!("err {}\n", e.to_string()).as_bytes()).await?;
+                        self.stream
+                            .write_all(format!("err {}\n", e.to_string()).as_bytes())
+                            .await?;
                         break;
                     }
                     let uuid = Uuid::new_v4().to_string();
@@ -212,7 +214,9 @@ impl Request {
                         base64::engine::general_purpose::NO_PAD,
                     );
                     let session_id = engine.encode(uuid);
-                    self.stream.write_all(format!("ok {}\n", session_id).as_bytes()).await?;
+                    self.stream
+                        .write_all(format!("ok {}\n", session_id).as_bytes())
+                        .await?;
                 }
                 3 => {
                     let params = match serde_json::from_slice::<serde_json::Value>(content) {
@@ -239,7 +243,9 @@ impl Request {
                         }
                         Err(e) => {
                             error!("parse request error: {}", e);
-                            self.stream.write_all(format!("err {}\n", e.to_string()).as_bytes()).await?;
+                            self.stream
+                                .write_all(format!("err {}\n", e.to_string()).as_bytes())
+                                .await?;
                             continue;
                         }
                     };
@@ -282,11 +288,15 @@ impl Request {
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
                             cmd_tx.send(Cmd::Upload(filepath, size as usize)).await?;
-                            self.stream.write_all(format!("ok {}\n", link).as_bytes()).await?;
+                            self.stream
+                                .write_all(format!("ok {}\n", link).as_bytes())
+                                .await?;
                         }
                         None => {
                             error!("session id not found");
-                            self.stream.write_all(format!("err {}\n", "bad session_id").as_bytes()).await?;
+                            self.stream
+                                .write_all(format!("err {}\n", "bad session_id").as_bytes())
+                                .await?;
                         }
                     }
                 }
@@ -308,11 +318,15 @@ impl Request {
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
                             cmd_tx.send(Cmd::Download(metadata.filepath)).await?;
-                            self.stream.write_all(format!("ok {}\n", metadata.filename).as_bytes()).await?;
+                            self.stream
+                                .write_all(format!("ok {}\n", metadata.filename).as_bytes())
+                                .await?;
                         }
                         None => {
                             error!("session id not found");
-                            self.stream.write_all(format!("err {}\n", "bad session_id").as_bytes()).await?;
+                            self.stream
+                                .write_all(format!("err {}\n", "bad session_id").as_bytes())
+                                .await?;
                             break;
                         }
                     }
@@ -454,9 +468,7 @@ impl Request {
 }
 
 pub(self) struct DataConnection {
-    reader: OwnedReadHalf,
-    writer: OwnedWriteHalf,
-    raw_fd: RawFd,
+    stream: TcpStream,
     cmd_rx: mpsc::Receiver<Cmd>,
     thread_pool: Arc<ThreadPool>,
     session_id: String,
@@ -468,12 +480,8 @@ impl DataConnection {
         cmd_rx: mpsc::Receiver<Cmd>,
         thread_pool: Arc<ThreadPool>,
     ) -> Self {
-        let raw_fd = stream.as_raw_fd();
-        let (reader, writer) = stream.into_split();
         Self {
-            reader,
-            writer,
-            raw_fd,
+            stream,
             cmd_rx,
             thread_pool,
             session_id: String::new(),
@@ -484,7 +492,7 @@ impl DataConnection {
         let mut buf = [0u8; 256];
         let mut idx = 0;
         loop {
-            let n = self.reader.read(&mut buf[idx..]).await?;
+            let n = self.stream.read(&mut buf[idx..]).await?;
             if n == 0 {
                 break;
             }
@@ -520,7 +528,7 @@ impl DataConnection {
             size,
             filepath.to_owned(),
             self.thread_pool.clone(),
-            &mut self.reader,
+            &mut self.stream,
         )
         .run()
         .await?;
@@ -530,9 +538,8 @@ impl DataConnection {
     pub(self) async fn download(&mut self, filepath: &str) -> anyhow::Result<()> {
         Download::new(
             filepath.to_owned(),
-            UnsafeFD { fd: self.raw_fd },
             self.thread_pool.clone(),
-            &mut self.writer,
+            &mut self.stream,
         )
         .run()
         .await?;
@@ -552,7 +559,7 @@ impl DataConnection {
             if n == 0 {
                 break;
             }
-            self.writer.write_all(&buffer[..n]).await?;
+            self.stream.write_all(&buffer[..n]).await?;
         }
         Ok(())
     }

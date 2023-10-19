@@ -1,4 +1,9 @@
-use std::{fs::{OpenOptions, File}, num::NonZeroUsize, os::fd::AsRawFd, sync::Arc};
+use std::{
+    fs::{File, OpenOptions},
+    num::NonZeroUsize,
+    os::fd::AsRawFd,
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 use nix::{
@@ -10,30 +15,31 @@ use nix::{
         sendfile,
     },
 };
-use tokio::{net::tcp::OwnedWriteHalf, sync::mpsc};
+use tokio::{net::TcpStream, sync::mpsc};
 use tracing::error;
 
 use crate::{net::UnsafeFD, pool::ThreadPool};
 
+use super::DirectStreamWriter;
+
 pub(super) struct Download<'a> {
     filepath: String,
-    socket_fd: UnsafeFD,
     thread_pool: Arc<ThreadPool>,
-    write_stream: &'a mut OwnedWriteHalf,
+    write_stream: DirectStreamWriter<'a>,
 }
 
 impl<'a> Download<'a> {
     pub(super) fn new(
         filepath: String,
-        socket_fd: UnsafeFD,
         thread_pool: Arc<ThreadPool>,
-        write_stream: &'a mut OwnedWriteHalf,
+        write_stream: &'a TcpStream,
     ) -> Self {
         Self {
             filepath,
-            socket_fd,
             thread_pool,
-            write_stream,
+            write_stream: DirectStreamWriter {
+                stream: write_stream,
+            },
         }
     }
 
@@ -57,28 +63,28 @@ impl<'a> Download<'a> {
             };
             let mut preload_size = preload.size;
             while preload_size > 0 {
-                self.write_stream.writable().await?;
+                let socket_fd = self.write_stream.await?;
                 #[cfg(target_os = "linux")]
-                    let n = {
-                    let res = sendfile::sendfile(
-                        socket.as_fd(),
-                        file.as_fd(),
-                        Some(&mut preload.offset),
-                        preload_size,
-                    );
+                let n = {
+                    let mut offset0 = preload.offset as i64;
+                    let res =
+                        sendfile::sendfile(socket_fd, preload.fd, Some(&mut offset0), preload_size);
                     match res {
                         Ok(n_sent) => n_sent,
                         Err(e) => {
+                            if e == nix::errno::Errno::EAGAIN {
+                                continue;
+                            }
                             error!("failed to sendfile: {}", e);
                             return Err(anyhow!("failed to sendfile: {}", e));
                         }
                     }
                 };
                 #[cfg(target_os = "macos")]
-                    let n = {
+                let n = {
                     let (res, n) = sendfile::sendfile(
                         preload.fd,
-                        self.socket_fd,
+                        socket_fd,
                         preload.offset as i64,
                         Some(preload_size as i64),
                         None,
@@ -88,7 +94,6 @@ impl<'a> Download<'a> {
                         if e == nix::errno::Errno::EAGAIN {
                             // a bug on macos while using with writable()
                             if n == 0 {
-                                tokio::time::sleep(std::time::Duration::from_micros(1)).await;
                                 continue;
                             }
                         } else {
@@ -149,7 +154,11 @@ impl DownloadHelper {
                 Ok(preload) => preload,
             };
             preload.load_data();
-            if self.content_tx.blocking_send(PreloadOrFile::P(preload)).is_err() {
+            if self
+                .content_tx
+                .blocking_send(PreloadOrFile::P(preload))
+                .is_err()
+            {
                 break;
             }
             offset += len;

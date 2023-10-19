@@ -1,6 +1,6 @@
 use std::{fs::OpenOptions, io::Write, sync::Arc};
 
-use tokio::{io::AsyncReadExt, net::tcp::OwnedReadHalf, sync::mpsc};
+use tokio::{io::AsyncReadExt, net::TcpStream, sync::mpsc};
 use tracing::error;
 
 use crate::pool::ThreadPool;
@@ -9,7 +9,7 @@ pub(super) struct Upload<'a> {
     size: usize,
     filepath: String,
     thread_pool: Arc<ThreadPool>,
-    read_stream: &'a mut OwnedReadHalf,
+    read_stream: &'a mut TcpStream,
 }
 
 impl<'a> Upload<'a> {
@@ -17,7 +17,7 @@ impl<'a> Upload<'a> {
         size: usize,
         filepath: String,
         thread_pool: Arc<ThreadPool>,
-        read_stream: &'a mut OwnedReadHalf,
+        read_stream: &'a mut TcpStream,
     ) -> Self {
         Self {
             size,
