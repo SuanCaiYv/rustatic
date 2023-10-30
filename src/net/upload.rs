@@ -62,6 +62,7 @@ impl<'a> Upload<'a> {
                                 }
                             }
                         }
+                        file.sync_all().unwrap();
                     },
                     || {},
                 )
