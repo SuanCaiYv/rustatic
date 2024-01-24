@@ -12,34 +12,42 @@ use ahash::AHashMap;
 use priority_queue::PriorityQueue;
 use sysinfo::{System, SystemExt};
 use tokio::{
-    sync::mpsc::{
+    sync::{mpsc::{
         self,
         error::{TryRecvError, TrySendError},
-    },
+    }, oneshot},
     time::Instant,
 };
 use tracing::{debug, error, warn};
 
-pub(self) struct Task {
-    pub(crate) f: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
-    pub(crate) notify: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
+pub(self) struct Task<T: 'static> {
+    pub(self) f: Box<dyn FnOnce() -> T + Send + Sync + 'static>,
+    pub(self) notify: Box<dyn FnOnce(T) -> () + Send + Sync + 'static>,
+    pub(self) sender: Option<oneshot::Sender<T>>,
 }
 
-impl Task {
-    pub(self) fn new<F, Notify>(f: F, notify: Notify) -> Self
+impl<T> Task<T> {
+    pub(self) fn new<F, Notify>(f: F, notify: Notify, sender: Option<oneshot::Sender<T>>) -> Self
         where
-            F: FnOnce() -> () + Send + Sync + 'static,
-            Notify: FnOnce() -> () + Send + Sync + 'static,
+            F: FnOnce() -> T + Send + Sync + 'static,
+            Notify: FnOnce(T) -> () + Send + Sync + 'static,
     {
         Self {
             f: Box::new(f),
             notify: Box::new(notify),
+            sender,
         }
     }
 
     pub(self) fn run(self) {
-        (self.f)();
-        (self.notify)();
+        let res = (self.f)();
+        if let Some(sender) = self.sender {
+            if let Err(_e) = sender.send(res) {
+                error!("send notify error.");
+            }
+        } else {
+            (self.notify)(res);
+        }
     }
 }
 
@@ -49,9 +57,9 @@ pub(self) struct Worker {
 }
 
 impl Worker {
-    pub(self) fn new(
+    pub(self) fn new<T: 'static + Send + Sync>(
         id: usize,
-        mut task_receiver: mpsc::Receiver<Task>,
+        mut task_receiver: mpsc::Receiver<Task<T>>,
         idle_notify: mpsc::Sender<usize>,
         status: Arc<AtomicBool>,
     ) -> Self {
@@ -103,12 +111,12 @@ impl Drop for Worker {
 }
 
 /// a thread pool for block syscall
-pub(crate) struct ThreadPool {
+pub(crate) struct ThreadPool<T: 'static> {
     workers_handle: Option<JoinHandle<()>>,
-    inner_tx: mpsc::Sender<Task>,
+    inner_tx: mpsc::Sender<Task<T>>,
 }
 
-impl ThreadPool {
+impl<T: 'static + Sync + Send> ThreadPool<T> {
     pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
         let mut sys = System::new();
         sys.refresh_cpu();
@@ -304,29 +312,29 @@ impl ThreadPool {
     /// if the cache queue for task is full, and number of threads reach the max_size,
     /// then the call of this method will block until the cache queue is not full.
     #[allow(unused)]
-    pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
+    pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify, sender: Option<oneshot::Sender<T>>) -> anyhow::Result<()>
         where
-            F: FnOnce() -> () + Send + Sync + 'static,
-            Notify: FnOnce() -> () + Send + Sync + 'static,
+            F: FnOnce() -> T + Send + Sync + 'static,
+            Notify: FnOnce(T) -> () + Send + Sync + 'static,
     {
-        let task = Task::new(f, notify);
+        let task = Task::new(f, notify, sender);
         self.inner_tx.blocking_send(task)?;
         Ok(())
     }
 
     /// if the cache queue is full and create more threads is not allow, the call will block on async context.
-    pub(crate) async fn execute_async<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
+    pub(crate) async fn execute_async<F, Notify>(&self, f: F, notify: Notify, sender: Option<oneshot::Sender<T>>) -> anyhow::Result<()>
         where
-            F: FnOnce() -> () + Send + Sync + 'static,
-            Notify: FnOnce() -> () + Send + Sync + 'static,
+            F: FnOnce() -> T + Send + Sync + 'static,
+            Notify: FnOnce(T) -> () + Send + Sync + 'static,
     {
-        let task = Task::new(f, notify);
+        let task = Task::new(f, notify, sender);
         self.inner_tx.send(task).await?;
         Ok(())
     }
 }
 
-impl Drop for ThreadPool {
+impl<T> Drop for ThreadPool<T> {
     fn drop(&mut self) {
         self.workers_handle.take().unwrap().join().unwrap();
     }

@@ -8,7 +8,7 @@ use crate::pool::ThreadPool;
 pub(super) struct Upload<'a> {
     size: usize,
     filepath: String,
-    thread_pool: Arc<ThreadPool>,
+    thread_pool: Arc<ThreadPool<()>>,
     read_stream: &'a mut TcpStream,
 }
 
@@ -16,7 +16,7 @@ impl<'a> Upload<'a> {
     pub(super) fn new(
         size: usize,
         filepath: String,
-        thread_pool: Arc<ThreadPool>,
+        thread_pool: Arc<ThreadPool<()>>,
         read_stream: &'a mut TcpStream,
     ) -> Self {
         Self {
@@ -64,7 +64,8 @@ impl<'a> Upload<'a> {
                         }
                         file.sync_all().unwrap();
                     },
-                    || {},
+                    |_v| {},
+                    None,
                 )
                 .await
             {

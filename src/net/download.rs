@@ -24,14 +24,14 @@ use super::DirectStreamWriter;
 
 pub(super) struct Download<'a> {
     filepath: String,
-    thread_pool: Arc<ThreadPool>,
+    thread_pool: Arc<ThreadPool<()>>,
     write_stream: DirectStreamWriter<'a>,
 }
 
 impl<'a> Download<'a> {
     pub(super) fn new(
         filepath: String,
-        thread_pool: Arc<ThreadPool>,
+        thread_pool: Arc<ThreadPool<()>>,
         write_stream: &'a TcpStream,
     ) -> Self {
         Self {
@@ -51,7 +51,8 @@ impl<'a> Download<'a> {
                 move || {
                     _ = download_helper.run();
                 },
-                || {},
+                |_v| {},
+                None,
             )
             .await?;
         while let Some(entry) = content_rx.recv().await {

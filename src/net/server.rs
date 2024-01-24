@@ -470,7 +470,7 @@ impl Request {
 pub(self) struct DataConnection {
     stream: TcpStream,
     cmd_rx: mpsc::Receiver<Cmd>,
-    thread_pool: Arc<ThreadPool>,
+    thread_pool: Arc<ThreadPool<()>>,
     session_id: String,
 }
 
@@ -478,7 +478,7 @@ impl DataConnection {
     pub(self) fn new(
         stream: TcpStream,
         cmd_rx: mpsc::Receiver<Cmd>,
-        thread_pool: Arc<ThreadPool>,
+        thread_pool: Arc<ThreadPool<()>>,
     ) -> Self {
         Self {
             stream,
