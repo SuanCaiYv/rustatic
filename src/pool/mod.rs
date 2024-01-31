@@ -12,42 +12,36 @@ use ahash::AHashMap;
 use priority_queue::PriorityQueue;
 use sysinfo::{System, SystemExt};
 use tokio::{
-    sync::{mpsc::{
-        self,
-        error::{TryRecvError, TrySendError},
-    }, oneshot},
+    sync::{
+        mpsc::{
+            self,
+            error::{TryRecvError, TrySendError},
+        },
+        oneshot,
+    },
     time::Instant,
 };
 use tracing::{debug, error, warn};
 
 pub(self) struct Task<T: 'static> {
     pub(self) f: Box<dyn FnOnce() -> T + Send + Sync + 'static>,
-    pub(self) notify: Box<dyn FnOnce(T) -> () + Send + Sync + 'static>,
-    pub(self) sender: Option<oneshot::Sender<T>>,
+    pub(self) sender: oneshot::Sender<T>,
 }
 
 impl<T> Task<T> {
-    pub(self) fn new<F, Notify>(f: F, notify: Notify, sender: Option<oneshot::Sender<T>>) -> Self
-        where
-            F: FnOnce() -> T + Send + Sync + 'static,
-            Notify: FnOnce(T) -> () + Send + Sync + 'static,
+    pub(self) fn new<F>(f: F, sender: oneshot::Sender<T>) -> Self
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
     {
         Self {
             f: Box::new(f),
-            notify: Box::new(notify),
             sender,
         }
     }
 
     pub(self) fn run(self) {
         let res = (self.f)();
-        if let Some(sender) = self.sender {
-            if let Err(_e) = sender.send(res) {
-                error!("send notify error.");
-            }
-        } else {
-            (self.notify)(res);
-        }
+        _ = self.sender.send(res);
     }
 }
 
@@ -90,6 +84,7 @@ impl Worker {
                             }
                         }
                         TryRecvError::Disconnected => {
+                            debug!("worker: {} released.", id);
                             break;
                         }
                     },
@@ -117,6 +112,9 @@ pub(crate) struct ThreadPool<T: 'static> {
 }
 
 impl<T: 'static + Sync + Send> ThreadPool<T> {
+    /// default size of thread created is equal to number of available cpu cores,
+    /// when all workers are busy, new thread will be created until reach the scale size,
+    /// when all workers with their sender be fully, create new thread until max size.
     pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
         let mut sys = System::new();
         sys.refresh_cpu();
@@ -162,6 +160,7 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
                                 };
                                 match status_map.get(&entry.0) {
                                     Some(status) => {
+                                        // idle worker detected.
                                         if status.load(Ordering::Acquire) {
                                             let mut idx = usize::MAX;
                                             for i in 0..workers.len() {
@@ -226,14 +225,15 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
                                                         idle_idx = index;
                                                     }
                                                 });
-                                            if task_senders[index].capacity() > remain_size {
-                                                remain_size = task_senders[index].capacity();
+                                            let cap = task_senders[index].capacity();
+                                            if cap > remain_size {
+                                                remain_size = cap;
                                                 sender_idx = index;
                                             }
                                             index += 1;
                                         });
 
-                                        // first, select a idle worker
+                                        // first, there exists idle worker, select it.
                                         if idle_idx != usize::MAX {
                                             let worker_id = workers[idle_idx].id;
                                             debug!("send task to idle worker: {}", worker_id);
@@ -312,25 +312,28 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
     /// if the cache queue for task is full, and number of threads reach the max_size,
     /// then the call of this method will block until the cache queue is not full.
     #[allow(unused)]
-    pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify, sender: Option<oneshot::Sender<T>>) -> anyhow::Result<()>
-        where
-            F: FnOnce() -> T + Send + Sync + 'static,
-            Notify: FnOnce(T) -> () + Send + Sync + 'static,
+    pub(crate) fn execute<F>(&self, f: F) -> anyhow::Result<oneshot::Receiver<T>>
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
     {
-        let task = Task::new(f, notify, sender);
+        let (sender, receiver) = oneshot::channel();
+        let task = Task::new(f, sender);
         self.inner_tx.blocking_send(task)?;
-        Ok(())
+        Ok(receiver)
     }
 
     /// if the cache queue is full and create more threads is not allow, the call will block on async context.
-    pub(crate) async fn execute_async<F, Notify>(&self, f: F, notify: Notify, sender: Option<oneshot::Sender<T>>) -> anyhow::Result<()>
-        where
-            F: FnOnce() -> T + Send + Sync + 'static,
-            Notify: FnOnce(T) -> () + Send + Sync + 'static,
+    pub(crate) async fn execute_async<F>(
+        &self,
+        f: F,
+    ) -> anyhow::Result<oneshot::Receiver<T>>
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
     {
-        let task = Task::new(f, notify, sender);
+        let (sender, receiver) = oneshot::channel();
+        let task = Task::new(f, sender);
         self.inner_tx.send(task).await?;
-        Ok(())
+        Ok(receiver)
     }
 }
 

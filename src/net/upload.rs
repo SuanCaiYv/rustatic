@@ -64,8 +64,6 @@ impl<'a> Upload<'a> {
                         }
                         file.sync_all().unwrap();
                     },
-                    |_v| {},
-                    None,
                 )
                 .await
             {

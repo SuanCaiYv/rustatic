@@ -51,8 +51,6 @@ impl<'a> Download<'a> {
                 move || {
                     _ = download_helper.run();
                 },
-                |_v| {},
-                None,
             )
             .await?;
         while let Some(entry) = content_rx.recv().await {
