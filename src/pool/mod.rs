@@ -12,34 +12,36 @@ use ahash::AHashMap;
 use priority_queue::PriorityQueue;
 use sysinfo::{System, SystemExt};
 use tokio::{
-    sync::mpsc::{
-        self,
-        error::{TryRecvError, TrySendError},
+    sync::{
+        mpsc::{
+            self,
+            error::{TryRecvError, TrySendError},
+        },
+        oneshot,
     },
     time::Instant,
 };
 use tracing::{debug, error, warn};
 
-pub(self) struct Task {
-    pub(crate) f: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
-    pub(crate) notify: Box<dyn FnOnce() -> () + Send + Sync + 'static>,
+pub(self) struct Task<T: 'static> {
+    pub(self) f: Box<dyn FnOnce() -> T + Send + Sync + 'static>,
+    pub(self) sender: oneshot::Sender<T>,
 }
 
-impl Task {
-    pub(self) fn new<F, Notify>(f: F, notify: Notify) -> Self
-        where
-            F: FnOnce() -> () + Send + Sync + 'static,
-            Notify: FnOnce() -> () + Send + Sync + 'static,
+impl<T> Task<T> {
+    pub(self) fn new<F>(f: F, sender: oneshot::Sender<T>) -> Self
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
     {
         Self {
             f: Box::new(f),
-            notify: Box::new(notify),
+            sender,
         }
     }
 
     pub(self) fn run(self) {
-        (self.f)();
-        (self.notify)();
+        let res = (self.f)();
+        _ = self.sender.send(res);
     }
 }
 
@@ -49,9 +51,9 @@ pub(self) struct Worker {
 }
 
 impl Worker {
-    pub(self) fn new(
+    pub(self) fn new<T: 'static + Send + Sync>(
         id: usize,
-        mut task_receiver: mpsc::Receiver<Task>,
+        mut task_receiver: mpsc::Receiver<Task<T>>,
         idle_notify: mpsc::Sender<usize>,
         status: Arc<AtomicBool>,
     ) -> Self {
@@ -82,6 +84,7 @@ impl Worker {
                             }
                         }
                         TryRecvError::Disconnected => {
+                            debug!("worker: {} released.", id);
                             break;
                         }
                     },
@@ -103,12 +106,15 @@ impl Drop for Worker {
 }
 
 /// a thread pool for block syscall
-pub(crate) struct ThreadPool {
+pub(crate) struct ThreadPool<T: 'static> {
     workers_handle: Option<JoinHandle<()>>,
-    inner_tx: mpsc::Sender<Task>,
+    inner_tx: mpsc::Sender<Task<T>>,
 }
 
-impl ThreadPool {
+impl<T: 'static + Sync + Send> ThreadPool<T> {
+    /// default size of thread created is equal to number of available cpu cores,
+    /// when all workers are busy, new thread will be created until reach the scale size,
+    /// when all workers with their sender be fully, create new thread until max size.
     pub(crate) fn new(scale_size: usize, max_size: usize, cache_size: usize) -> Self {
         let mut sys = System::new();
         sys.refresh_cpu();
@@ -154,6 +160,7 @@ impl ThreadPool {
                                 };
                                 match status_map.get(&entry.0) {
                                     Some(status) => {
+                                        // idle worker detected.
                                         if status.load(Ordering::Acquire) {
                                             let mut idx = usize::MAX;
                                             for i in 0..workers.len() {
@@ -218,14 +225,15 @@ impl ThreadPool {
                                                         idle_idx = index;
                                                     }
                                                 });
-                                            if task_senders[index].capacity() > remain_size {
-                                                remain_size = task_senders[index].capacity();
+                                            let cap = task_senders[index].capacity();
+                                            if cap > remain_size {
+                                                remain_size = cap;
                                                 sender_idx = index;
                                             }
                                             index += 1;
                                         });
 
-                                        // first, select a idle worker
+                                        // first, there exists idle worker, select it.
                                         if idle_idx != usize::MAX {
                                             let worker_id = workers[idle_idx].id;
                                             debug!("send task to idle worker: {}", worker_id);
@@ -304,29 +312,32 @@ impl ThreadPool {
     /// if the cache queue for task is full, and number of threads reach the max_size,
     /// then the call of this method will block until the cache queue is not full.
     #[allow(unused)]
-    pub(crate) fn execute<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
-        where
-            F: FnOnce() -> () + Send + Sync + 'static,
-            Notify: FnOnce() -> () + Send + Sync + 'static,
+    pub(crate) fn execute<F>(&self, f: F) -> anyhow::Result<oneshot::Receiver<T>>
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
     {
-        let task = Task::new(f, notify);
+        let (sender, receiver) = oneshot::channel();
+        let task = Task::new(f, sender);
         self.inner_tx.blocking_send(task)?;
-        Ok(())
+        Ok(receiver)
     }
 
     /// if the cache queue is full and create more threads is not allow, the call will block on async context.
-    pub(crate) async fn execute_async<F, Notify>(&self, f: F, notify: Notify) -> anyhow::Result<()>
-        where
-            F: FnOnce() -> () + Send + Sync + 'static,
-            Notify: FnOnce() -> () + Send + Sync + 'static,
+    pub(crate) async fn execute_async<F>(
+        &self,
+        f: F,
+    ) -> anyhow::Result<oneshot::Receiver<T>>
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
     {
-        let task = Task::new(f, notify);
+        let (sender, receiver) = oneshot::channel();
+        let task = Task::new(f, sender);
         self.inner_tx.send(task).await?;
-        Ok(())
+        Ok(receiver)
     }
 }
 
-impl Drop for ThreadPool {
+impl<T> Drop for ThreadPool<T> {
     fn drop(&mut self) {
         self.workers_handle.take().unwrap().join().unwrap();
     }

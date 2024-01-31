@@ -5,10 +5,12 @@ use tracing::error;
 
 use crate::pool::ThreadPool;
 
+use super::server::ThreadPoolResult;
+
 pub(super) struct Upload<'a> {
     size: usize,
     filepath: String,
-    thread_pool: Arc<ThreadPool>,
+    thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
     read_stream: &'a mut TcpStream,
 }
 
@@ -16,7 +18,7 @@ impl<'a> Upload<'a> {
     pub(super) fn new(
         size: usize,
         filepath: String,
-        thread_pool: Arc<ThreadPool>,
+        thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
         read_stream: &'a mut TcpStream,
     ) -> Self {
         Self {
@@ -63,8 +65,8 @@ impl<'a> Upload<'a> {
                             }
                         }
                         file.sync_all().unwrap();
+                        return ThreadPoolResult::None;
                     },
-                    || {},
                 )
                 .await
             {

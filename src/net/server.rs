@@ -79,7 +79,7 @@ impl Server {
         let conn_map = data_conn_map.clone();
         tokio::spawn(async move {
             info!("data listener started");
-            let thread_pool = Arc::new(ThreadPool::new(24, 180, 200));
+            let thread_pool = Arc::new(ThreadPool::new(24, 180, 20));
             loop {
                 let (data_stream, _) = match data_listener.accept().await {
                     Ok(x) => x,
@@ -467,10 +467,16 @@ impl Request {
     }
 }
 
+pub(super) enum ThreadPoolResult {
+    Usize(usize),
+    None,
+    Err(anyhow::Error),
+}
+
 pub(self) struct DataConnection {
     stream: TcpStream,
     cmd_rx: mpsc::Receiver<Cmd>,
-    thread_pool: Arc<ThreadPool>,
+    thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
     session_id: String,
 }
 
@@ -478,7 +484,7 @@ impl DataConnection {
     pub(self) fn new(
         stream: TcpStream,
         cmd_rx: mpsc::Receiver<Cmd>,
-        thread_pool: Arc<ThreadPool>,
+        thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
     ) -> Self {
         Self {
             stream,
