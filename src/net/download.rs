@@ -47,11 +47,9 @@ impl<'a> Download<'a> {
         let (content_tx, mut content_rx) = mpsc::channel(64);
         let mut download_helper = DownloadHelper::new(self.filepath.clone(), 4096 * 64, content_tx);
         self.thread_pool
-            .execute_async(
-                move || {
-                    _ = download_helper.run();
-                },
-            )
+            .execute_async(move || {
+                _ = download_helper.run();
+            })
             .await?;
         while let Some(entry) = content_rx.recv().await {
             let mut preload = match entry {
@@ -72,6 +70,8 @@ impl<'a> Download<'a> {
                         Ok(n_sent) => n_sent,
                         Err(e) => {
                             if e == nix::errno::Errno::EAGAIN {
+                                // there may be a fake positive readiness, resemble to `WouldBlock` retry
+                                // in mio's implement.
                                 continue;
                             }
                             error!("failed to sendfile: {}", e);
@@ -91,7 +91,7 @@ impl<'a> Download<'a> {
                     );
                     if let Err(e) = res {
                         if e == nix::errno::Errno::EAGAIN {
-                            // a bug on macos while using with writable()
+                            // same as front.
                             if n == 0 {
                                 continue;
                             }

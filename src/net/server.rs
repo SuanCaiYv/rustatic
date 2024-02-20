@@ -12,7 +12,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -148,7 +148,8 @@ impl Request {
             let op_code = match self.stream.read_u16().await {
                 Ok(code) => code,
                 Err(e) => {
-                    warn!("read request error: {}", e);
+                    self.stream.shutdown().await?;
+                    info!("client closed connection: {}", e);
                     break;
                 }
             };
@@ -319,7 +320,10 @@ impl Request {
                         Some(cmd_tx) => {
                             cmd_tx.send(Cmd::Download(metadata.filepath)).await?;
                             self.stream
-                                .write_all(format!("ok {}\n", metadata.filename).as_bytes())
+                                .write_all(
+                                    format!("ok {} {}\n", metadata.filename, metadata.size)
+                                        .as_bytes(),
+                                )
                                 .await?;
                         }
                         None => {
