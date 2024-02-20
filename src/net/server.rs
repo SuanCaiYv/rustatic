@@ -12,7 +12,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -65,13 +65,13 @@ impl Server {
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let data_listener = TcpListener::bind(
             format!("0.0.0.0:{}", data_port)
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
         let data_conn_map = Arc::new(DashMap::new());
@@ -148,7 +148,7 @@ impl Request {
             let op_code = match self.stream.read_u16().await {
                 Ok(code) => code,
                 Err(e) => {
-                    warn!("read request error: {}", e);
+                    info!("connection closed: {}", e);
                     break;
                 }
             };
@@ -319,7 +319,7 @@ impl Request {
                         Some(cmd_tx) => {
                             cmd_tx.send(Cmd::Download(metadata.filepath)).await?;
                             self.stream
-                                .write_all(format!("ok {}\n", metadata.filename).as_bytes())
+                                .write_all(format!("ok {} {}\n", metadata.filename, metadata.size).as_bytes())
                                 .await?;
                         }
                         None => {
@@ -536,8 +536,8 @@ impl DataConnection {
             self.thread_pool.clone(),
             &mut self.stream,
         )
-        .run()
-        .await?;
+            .run()
+            .await?;
         Ok(())
     }
 
@@ -547,8 +547,8 @@ impl DataConnection {
             self.thread_pool.clone(),
             &mut self.stream,
         )
-        .run()
-        .await?;
+            .run()
+            .await?;
         Ok(())
     }
 

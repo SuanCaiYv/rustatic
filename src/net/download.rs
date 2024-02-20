@@ -49,6 +49,8 @@ impl<'a> Download<'a> {
                         match res {
                             Ok(n_sent) => n_sent,
                             Err(e) => {
+                                // like `WouldBlock` retry in mio, the readiness maybe fake positive.
+                                // so we should retry.
                                 if e == nix::errno::Errno::EAGAIN {
                                     return ThreadPoolResult::Usize(0);
                                 }
@@ -69,7 +71,7 @@ impl<'a> Download<'a> {
                         );
                         if let Err(e) = res {
                             if e == nix::errno::Errno::EAGAIN {
-                                // a bug on macos while using with writable()
+                                // same as front
                                 if n == 0 {
                                     return ThreadPoolResult::Usize(0);
                                 }
