@@ -43,24 +43,24 @@ impl<'a> Download<'a> {
                 .thread_pool
                 .execute_async(move || {
                     #[cfg(target_os = "linux")]
-                    let n = {
+                    {
                         let mut offset0 = idx as i64;
-                        let res = sendfile::sendfile(socket_fd, file_fd, Some(&mut offset0), 4096 * 4);
-                        match res {
-                            Ok(n_sent) => n_sent,
-                            Err(e) => {
-                                // like `WouldBlock` retry in mio, the readiness maybe fake positive.
-                                // so we should retry.
-                                if e == nix::errno::Errno::EAGAIN {
-                                    return ThreadPoolResult::Usize(0);
+                        loop {
+                            let res = sendfile::sendfile(socket_fd, file_fd, Some(&mut offset0), 4096 * 4);
+                            if res.is_err() {
+                                if res.unwrap_err() == nix::errno::Errno::EAGAIN {
+                                    continue;
+                                } else {
+                                    error!("failed to sendfile: {}", res.unwrap_err());
+                                    return ThreadPoolResult::Err(anyhow!("failed to sendfile: {}", res.unwrap_err()));
                                 }
-                                error!("failed to sendfile: {}", e);
-                                return ThreadPoolResult::Err(anyhow!("failed to sendfile: {}", e));
                             }
+                            let n_sent = res.unwrap();
+                            return ThreadPoolResult::Usize(n_sent);
                         }
-                    };
+                    }
                     #[cfg(target_os = "macos")]
-                    let n = {
+                    loop {
                         let (res, n) = sendfile::sendfile(
                             file_fd,
                             socket_fd,
@@ -70,19 +70,24 @@ impl<'a> Download<'a> {
                             None,
                         );
                         if let Err(e) = res {
+                            // `EAGAIN` same as `WouldBlock`
+                            // resource temporary unavailable, retry
                             if e == nix::errno::Errno::EAGAIN {
                                 // same as front
                                 if n == 0 {
-                                    return ThreadPoolResult::Usize(0);
+                                    continue;
+                                } else {
+                                    println!("sendfile: {}", n);
+                                    return ThreadPoolResult::Usize(n as usize);
                                 }
                             } else {
                                 error!("failed to sendfile: {}", e);
                                 return ThreadPoolResult::Err(anyhow!("failed to sendfile: {}", e));
                             }
+                        } else {
+                            return ThreadPoolResult::Usize(n as usize);
                         }
-                        n as usize
-                    };
-                    return ThreadPoolResult::Usize(n);
+                    }
                 })
                 .await?
                 .await?
