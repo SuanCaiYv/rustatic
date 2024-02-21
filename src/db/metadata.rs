@@ -221,4 +221,33 @@ impl MetadataDB {
         }).await?;
         Ok(res)
     }
+
+    pub(crate) async fn list_by_owner(&self, owner: String) -> anyhow::Result<Vec<Metadata>> {
+        let res = self.conn.call(move |conn| {
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, create_time, update_time, delete_time FROM metadata WHERE owner = ?1")?;
+            let res = statement
+                .query_map(params![owner], |row| {
+                    let metadata = Metadata {
+                        id: row.get(0)?,
+                        filename: row.get(1)?,
+                        owner: row.get(2)?,
+                        link: row.get(3)?,
+                        size: row.get(4)?,
+                        sha256: row.get(5)?,
+                        filepath: row.get(6)?,
+                        encrypt_key: row.get(7)?,
+                        permissions: row.get(8)?,
+                        r#type: row.get(9)?,
+                        classification: row.get(10)?,
+                        create_time: row.get(11)?,
+                        update_time: row.get(12)?,
+                        delete_time: row.get(13)?,
+                    };
+                    Ok::<Metadata, rusqlite::Error>(metadata)
+                })?
+                .collect::<Result<Vec<Metadata>, rusqlite::Error>>()?;
+            Ok::<Vec<Metadata>, rusqlite::Error>(res)
+        }).await?;
+        Ok(res)
+    }
 }

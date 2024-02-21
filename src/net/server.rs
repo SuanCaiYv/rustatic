@@ -368,6 +368,33 @@ impl Request {
                         }
                     }
                 }
+                6 => {
+                    let username = String::from_utf8_lossy(&content[0..req_len as usize]);
+                    match get_metadata_ops().await.list_by_owner(username.to_string()).await {
+                        Ok(res) => {
+                            let mut res_str = String::new();
+                            for metadata in res {
+                                res_str.push_str(&format!(
+                                    "{} {} {} {} {} {} ",
+                                    metadata.filename,
+                                    metadata.size,
+                                    metadata.create_time,
+                                    metadata.update_time,
+                                    metadata.delete_time,
+                                    metadata.link
+                                ));
+                            }
+                            self.stream.write_all(format!("ok {}\n", res_str).as_bytes()).await?;
+                        }
+                        Err(e) => {
+                            error!("list metadata error: {}", e);
+                            self.stream
+                                .write_all(format!("err {}\n", "list files failed").as_bytes())
+                                .await?;
+                            break;
+                        }
+                    }
+                }
                 _ => {
                     error!("unknown op code: {}", op_code);
                     break;
