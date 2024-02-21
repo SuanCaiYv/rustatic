@@ -46,7 +46,7 @@ impl<'a> Download<'a> {
                     {
                         let mut offset0 = idx as i64;
                         loop {
-                            let res = sendfile::sendfile(socket_fd, file_fd, Some(&mut offset0), 4096 * 4);
+                            let res = sendfile::sendfile(socket_fd, file_fd, Some(&mut offset0), 1024 * 1024 * 4);
                             if res.is_err() {
                                 if res.unwrap_err() == nix::errno::Errno::EAGAIN {
                                     continue;
@@ -65,7 +65,7 @@ impl<'a> Download<'a> {
                             file_fd,
                             socket_fd,
                             idx as i64,
-                            Some(4096 * 4),
+                            None,
                             None,
                             None,
                         );
@@ -77,7 +77,8 @@ impl<'a> Download<'a> {
                                 if n == 0 {
                                     continue;
                                 } else {
-                                    println!("sendfile: {}", n);
+                                    println!("sent: {}", n);
+                                    // macos return `EAGAIN` doesn't mean 0 bytes sent
                                     return ThreadPoolResult::Usize(n as usize);
                                 }
                             } else {
@@ -85,6 +86,7 @@ impl<'a> Download<'a> {
                                 return ThreadPoolResult::Err(anyhow!("failed to sendfile: {}", e));
                             }
                         } else {
+                            println!("sent: {}", n);
                             return ThreadPoolResult::Usize(n as usize);
                         }
                     }

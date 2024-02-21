@@ -147,8 +147,8 @@ impl Request {
         loop {
             let op_code = match self.stream.read_u16().await {
                 Ok(code) => code,
-                Err(e) => {
-                    info!("connection closed: {}", e);
+                Err(_e) => {
+                    info!("connection closed");
                     break;
                 }
             };
@@ -171,6 +171,7 @@ impl Request {
                 }
             };
             match op_code {
+                // sign
                 1 => {
                     let params = Self::parse1(content)?;
                     curr_user = Some(params.0.clone());
@@ -191,6 +192,7 @@ impl Request {
                         .write_all(format!("ok {}\n", session_id).as_bytes())
                         .await?;
                 }
+                // login
                 2 => {
                     let params = Self::parse1(content)?;
                     if let Some(ref curr_user) = curr_user {
@@ -218,6 +220,7 @@ impl Request {
                         .write_all(format!("ok {}\n", session_id).as_bytes())
                         .await?;
                 }
+                // upload
                 3 => {
                     let params = match serde_json::from_slice::<serde_json::Value>(content) {
                         Ok(entry) => {
@@ -300,6 +303,7 @@ impl Request {
                         }
                     }
                 }
+                // download
                 4 => {
                     let (session_id, link) = Self::parse2(content)?;
                     let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await {
@@ -349,11 +353,17 @@ impl Request {
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
                             cmd_tx
-                                .send(Cmd::DownloadDirectly(metadata.filepath))
+                                .send(Cmd::DownloadDirectly(metadata.filepath, metadata.size as usize))
+                                .await?;
+                            self.stream
+                                .write_all(format!("ok {} {}\n", metadata.filename, metadata.size).as_bytes())
                                 .await?;
                         }
                         None => {
                             error!("session id not found");
+                            self.stream
+                                .write_all(format!("err {}\n", "bad session_id").as_bytes())
+                                .await?;
                             break;
                         }
                     }
@@ -519,8 +529,8 @@ impl DataConnection {
                 Some(cmd) => match cmd {
                     Cmd::Upload(filename, size) => self.upload(filename.as_str(), size).await?,
                     Cmd::Download(filename) => self.download(filename.as_str()).await?,
-                    Cmd::DownloadDirectly(filename) => {
-                        self.download_directly(filename.as_str()).await?
+                    Cmd::DownloadDirectly(filename, size) => {
+                        self.download_directly(filename.as_str(), size).await?
                     }
                 },
                 None => break,
@@ -552,20 +562,26 @@ impl DataConnection {
         Ok(())
     }
 
-    pub(self) async fn download_directly(&mut self, filepath: &str) -> anyhow::Result<()> {
+    pub(self) async fn download_directly(&mut self, filepath: &str, size: usize) -> anyhow::Result<()> {
         let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .append(true)
+            .read(true)
+            .write(false)
             .open(filepath)
             .await
             .unwrap();
-        let mut buffer = BytesMut::with_capacity(4096 * 4);
+        let mut buffer = Vec::with_capacity(1024 * 1024 * 4);
+        unsafe {
+            buffer.set_len(1024 * 1024 * 4)
+        };
+        let buffer = buffer.as_mut_slice();
+        let mut total = 0;
         loop {
-            let n = file.read(&mut buffer).await?;
-            if n == 0 {
+            let n = file.read(&mut buffer[..]).await?;
+            total += n;
+            self.stream.write_all(&buffer[..n]).await?;
+            if total == size {
                 break;
             }
-            self.stream.write_all(&buffer[..n]).await?;
         }
         Ok(())
     }
@@ -574,7 +590,7 @@ impl DataConnection {
 pub(self) enum Cmd {
     Upload(String, usize),
     Download(String),
-    DownloadDirectly(String),
+    DownloadDirectly(String, usize),
 }
 
 pub(super) struct UnsafePlaceholder<T> {
