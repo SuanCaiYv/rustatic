@@ -1,4 +1,5 @@
 /target
 .idea
 .vscode
+src/.DS_Store
 .DS_Store
