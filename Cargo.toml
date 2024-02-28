@@ -33,4 +33,5 @@ futures = "0.3.28"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+blocking = "1.5.1"
 coordinator = { git = "https://github.com/SuanCaiYv/coordinator"}

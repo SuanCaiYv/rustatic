@@ -64,20 +64,20 @@ impl Worker {
                 let task = match task_receiver.try_recv() {
                     Ok(task) => {
                         debug!("worker: {} try recv task success", id);
-                        status.store(false, Ordering::Release);
+                        // status.store(false, Ordering::Release);
                         task
                     }
                     Err(e) => match e {
                         TryRecvError::Empty => {
                             debug!("worker: {} try recv task failed", id);
-                            status.store(true, Ordering::Release);
-                            if idle_notify.blocking_send(id).is_err() {
-                                break;
-                            }
+                            // status.store(true, Ordering::Release);
+                            // if idle_notify.blocking_send(id).is_err() {
+                            //     break;
+                            // }
                             match task_receiver.blocking_recv() {
                                 Some(task) => {
                                     debug!("worker: {} blocking recv task success", id);
-                                    status.store(false, Ordering::Release);
+                                    // status.store(false, Ordering::Release);
                                     task
                                 }
                                 None => break,
@@ -132,7 +132,7 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
                     let mut workers = Vec::with_capacity(default_size);
                     let mut task_senders = Vec::with_capacity(default_size);
                     let mut status_map = AHashMap::new();
-                    let (idle_tx, mut idle_rx) = mpsc::channel(default_size * 8);
+                    let (idle_tx, mut idle_rx) = mpsc::channel(default_size * 1024);
 
                     for i in 0..default_size {
                         let status = Arc::new(AtomicBool::new(false));
@@ -153,63 +153,63 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
 
                     loop {
                         tokio::select! {
-                            _ = &mut timer => {
-                                let entry = match pq.pop() {
-                                    Some(entry) => entry,
-                                    None => continue,
-                                };
-                                match status_map.get(&entry.0) {
-                                    Some(status) => {
-                                        // idle worker detected.
-                                        if status.load(Ordering::Acquire) {
-                                            let mut idx = usize::MAX;
-                                            for i in 0..workers.len() {
-                                                if workers[i].id == entry.0 {
-                                                    idx = i;
-                                                }
-                                            }
-                                            if idx == usize::MAX {
-                                                error!("worker: {} not found", entry.0);
-                                                break;
-                                            }
-                                            if workers.len() > default_size {
-                                                debug!("remove worker: {}", entry.0);
-                                                task_senders.remove(idx);
-                                                workers.remove(idx);
-                                                status_map.remove(&entry.0);
-                                            }
-                                        } else {
-                                            debug!("worker: {} is not idle", entry.0);
-                                        }
-                                    },
-                                    None => continue,
-                                }
-                                let reset_time = match pq.peek() {
-                                    Some(entry) => {
-                                        entry.1.0
-                                    }
-                                    None => {
-                                        debug!("no worker idle");
-                                        Instant::now() + sleep_duration
-                                    }
-                                };
-                                timer.as_mut().reset(reset_time);
-                            }
-                            idle = idle_rx.recv() => {
-                                match idle {
-                                    Some(id) => {
-                                        debug!("worker: {} idle", id);
-                                        let trigger_instant = Instant::now() + idle_duration;
-                                        pq.push(id, Reverse(trigger_instant));
-                                        let reset_time = pq.peek().unwrap().1.0;
-                                        timer.as_mut().reset(reset_time);
-                                    }
-                                    None => {
-                                        error!("idle_rx recv None");
-                                        break;
-                                    },
-                                }
-                            }
+                            // _ = &mut timer => {
+                            //     let entry = match pq.pop() {
+                            //         Some(entry) => entry,
+                            //         None => continue,
+                            //     };
+                            //     match status_map.get(&entry.0) {
+                            //         Some(status) => {
+                            //             // idle worker detected.
+                            //             if status.load(Ordering::Acquire) {
+                            //                 let mut idx = usize::MAX;
+                            //                 for i in 0..workers.len() {
+                            //                     if workers[i].id == entry.0 {
+                            //                         idx = i;
+                            //                     }
+                            //                 }
+                            //                 if idx == usize::MAX {
+                            //                     error!("worker: {} not found", entry.0);
+                            //                     break;
+                            //                 }
+                            //                 if workers.len() > default_size {
+                            //                     debug!("remove worker: {}", entry.0);
+                            //                     task_senders.remove(idx);
+                            //                     workers.remove(idx);
+                            //                     status_map.remove(&entry.0);
+                            //                 }
+                            //             } else {
+                            //                 debug!("worker: {} is not idle", entry.0);
+                            //             }
+                            //         },
+                            //         None => continue,
+                            //     }
+                            //     let reset_time = match pq.peek() {
+                            //         Some(entry) => {
+                            //             entry.1.0
+                            //         }
+                            //         None => {
+                            //             debug!("no worker idle");
+                            //             Instant::now() + sleep_duration
+                            //         }
+                            //     };
+                            //     timer.as_mut().reset(reset_time);
+                            // }
+                            // idle = idle_rx.recv() => {
+                            //     match idle {
+                            //         Some(id) => {
+                            //             debug!("worker: {} idle", id);
+                            //             let trigger_instant = Instant::now() + idle_duration;
+                            //             pq.push(id, Reverse(trigger_instant));
+                            //             let reset_time = pq.peek().unwrap().1.0;
+                            //             timer.as_mut().reset(reset_time);
+                            //         }
+                            //         None => {
+                            //             error!("idle_rx recv None");
+                            //             break;
+                            //         },
+                            //     }
+                            // }
                             task = inner_rx.recv() => {
                                 match task {
                                     Some(task) => {
@@ -345,10 +345,38 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
     {
         return Ok(f());
     }
+
+    #[allow(unused)]
+    pub(crate) fn execute_block<F>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
+    {
+        f()
+    }
 }
 
 impl<T> Drop for ThreadPool<T> {
     fn drop(&mut self) {
         self.workers_handle.take().unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Instant;
+    use blocking::unblock;
+
+    use super::ThreadPool;
+
+    #[tokio::test]
+    async fn test() {
+        let pool: ThreadPool<i64> = super::ThreadPool::new(1, 4, 8);
+        let t = Instant::now();
+        let n: u32 = 1000;
+        for i in 0..n {
+            let res: i64 = unblock(move || i).await as i64;
+            assert_eq!(res, i as i64);
+        }
+        println!("cost: {:?}", t.elapsed() / n);
     }
 }
