@@ -49,12 +49,17 @@ impl<'a> Download<'a> {
                         loop {
                             let res = sendfile::sendfile(socket_fd, file_fd, Some(&mut offset0), 1024 * 1024 * 4);
                             if res.is_err() {
-                                // `EAGAIN` same as `WouldBlock`
-                                // resource temporary unavailable, retry
-                                // but the fake positive generated from epoll will squander thread schedule
+                                // `EAGAIN` same as `WouldBlock`.
+                                // Means resource temporary unavailable, retry again.
+                                //
+                                // The fake positive generated from epoll will squander thread schedule
                                 // of thread-pool.
+                                //
+                                // One possible reason of this scenario is that peer's buffer is full,
+                                // but target socket buffer is available. So epoll return `EPOLLOUT` event, but
+                                // we can't send any data to peer.
                                 if res.unwrap_err() == nix::errno::Errno::EAGAIN {
-                                    continue;
+                                    return ThreadPoolResult::Usize(0);
                                 } else {
                                     error!("failed to sendfile: {}", res.unwrap_err());
                                     return ThreadPoolResult::Err(anyhow!("failed to sendfile: {}", res.unwrap_err()));
@@ -75,14 +80,19 @@ impl<'a> Download<'a> {
                             None,
                         );
                         if let Err(e) = res {
-                            // `EAGAIN` same as `WouldBlock`
-                            // resource temporary unavailable, retry
-                            // but the fake positive generated from epoll will squander thread schedule
+                            // `EAGAIN` same as `WouldBlock`.
+                            // Means resource temporary unavailable, retry again.
+                            //
+                            // The fake positive generated from epoll will squander thread schedule
                             // of thread-pool.
+                            //
+                            // One possible reason of this scenario is that peer's buffer is full,
+                            // but target socket buffer is available. So epoll return `EPOLLOUT` event, but
+                            // we can't send any data to peer.
                             if e == nix::errno::Errno::EAGAIN {
                                 // same as front
                                 if n == 0 {
-                                    continue;
+                                    return ThreadPoolResult::Usize(0);
                                 } else {
                                     // println!("sent: {}", n);
                                     // macos return `EAGAIN` doesn't mean 0 bytes sent
