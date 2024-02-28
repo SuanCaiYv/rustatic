@@ -1,16 +1,16 @@
 use std::{fs::OpenOptions, io::Write, sync::Arc};
 
+use coordinator::pool::automatic::ThreadPool;
+
 use tokio::{io::AsyncReadExt, net::TcpStream, sync::mpsc};
 use tracing::error;
-
-use crate::pool::ThreadPool;
 
 use super::server::ThreadPoolResult;
 
 pub(super) struct Upload<'a> {
     size: usize,
     filepath: String,
-    thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+    thread_pool: ThreadPool<ThreadPoolResult>,
     read_stream: &'a mut TcpStream,
 }
 
@@ -18,7 +18,7 @@ impl<'a> Upload<'a> {
     pub(super) fn new(
         size: usize,
         filepath: String,
-        thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+        thread_pool: ThreadPool<ThreadPoolResult>,
         read_stream: &'a mut TcpStream,
     ) -> Self {
         Self {
@@ -36,7 +36,7 @@ impl<'a> Upload<'a> {
 
         tokio::spawn(async move {
             if let Err(e) = pool
-                .execute_async(
+                .submit(
                     move || {
                         _ = std::fs::create_dir_all(
                             std::path::Path::new(filepath.as_str())

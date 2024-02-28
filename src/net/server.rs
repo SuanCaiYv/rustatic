@@ -3,6 +3,7 @@ use std::{cell::UnsafeCell, net::SocketAddr, sync::Arc};
 use anyhow::anyhow;
 use base64::Engine;
 use bytes::BytesMut;
+use coordinator::pool::automatic::ThreadPool;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -17,7 +18,6 @@ use uuid::Uuid;
 
 use crate::{
     db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User},
-    pool::ThreadPool,
 };
 
 use super::{download::Download, upload::Upload};
@@ -79,7 +79,7 @@ impl Server {
         let conn_map = data_conn_map.clone();
         tokio::spawn(async move {
             info!("data listener started");
-            let thread_pool = Arc::new(ThreadPool::new(24, 180, 20));
+            let thread_pool = coordinator::pool::Builder::new().scale_size(200).maximum_size(400).queue_size(102400).build_automatic();
             loop {
                 let (data_stream, _) = match data_listener.accept().await {
                     Ok(x) => x,
@@ -513,7 +513,7 @@ pub(super) enum ThreadPoolResult {
 pub(self) struct DataConnection {
     stream: TcpStream,
     cmd_rx: mpsc::Receiver<Cmd>,
-    thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+    thread_pool: ThreadPool<ThreadPoolResult>,
     session_id: String,
 }
 
@@ -521,7 +521,7 @@ impl DataConnection {
     pub(self) fn new(
         stream: TcpStream,
         cmd_rx: mpsc::Receiver<Cmd>,
-        thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+        thread_pool: ThreadPool<ThreadPoolResult>,
     ) -> Self {
         Self {
             stream,
