@@ -41,7 +41,7 @@ impl<'a> Download<'a> {
             let socket_fd = self.write_stream.await?;
             match self
                 .thread_pool
-                .execute_async(move || {
+                .execute_block(move || {
                     #[cfg(target_os = "linux")]
                     {
                         let mut offset0 = idx as i64;
@@ -90,9 +90,7 @@ impl<'a> Download<'a> {
                             return ThreadPoolResult::Usize(n as usize);
                         }
                     }
-                })
-                .await?
-                .await?
+                })?
             {
                 ThreadPoolResult::Usize(n) => {
                     idx += n;

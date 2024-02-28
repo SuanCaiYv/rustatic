@@ -335,6 +335,16 @@ impl<T: 'static + Sync + Send> ThreadPool<T> {
         self.inner_tx.send(task).await?;
         Ok(receiver)
     }
+    
+    pub(crate) fn execute_block<F>(
+        &self,
+        f: F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
+    {
+        return Ok(f());
+    }
 }
 
 impl<T> Drop for ThreadPool<T> {
