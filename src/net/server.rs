@@ -180,7 +180,6 @@ impl Request {
                         self.stream
                             .write_all(format!("err {}\n", e.to_string()).as_bytes())
                             .await?;
-                        break;
                     }
                     let uuid = Uuid::new_v4().to_string();
                     let engine = base64::engine::GeneralPurpose::new(
@@ -198,7 +197,6 @@ impl Request {
                     if let Some(ref curr_user) = curr_user {
                         if curr_user != &params.0 {
                             error!("user not match");
-                            break;
                         }
                     } else {
                         curr_user = Some(params.0.clone());
@@ -208,7 +206,6 @@ impl Request {
                         self.stream
                             .write_all(format!("err {}\n", e.to_string()).as_bytes())
                             .await?;
-                        break;
                     }
                     let uuid = Uuid::new_v4().to_string();
                     let engine = base64::engine::GeneralPurpose::new(
@@ -596,9 +593,9 @@ impl DataConnection {
             .open(filepath)
             .await
             .unwrap();
-        let mut buffer = Vec::with_capacity(1024 * 1024 * 4);
+        let mut buffer = Vec::with_capacity(1024 * 1024 * 8);
         unsafe {
-            buffer.set_len(1024 * 1024 * 4)
+            buffer.set_len(1024 * 1024 * 8)
         };
         let buffer = buffer.as_mut_slice();
         let mut total = 0;
