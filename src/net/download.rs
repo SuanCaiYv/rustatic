@@ -1,30 +1,30 @@
 use std::{fs::OpenOptions, os::fd::AsRawFd};
 
 use anyhow::anyhow;
-use coordinator::pool::automatic::ThreadPool;
+use coordinator::pool::automatic::Submitter;
 use nix::sys::sendfile;
 use tokio::net::TcpStream;
 use tracing::error;
 
-use crate::{net::UnsafeFD};
+use crate::net::UnsafeFD;
 
 use super::{server::ThreadPoolResult, DirectStreamWriter};
 
 pub(super) struct Download<'a> {
     filepath: String,
-    thread_pool: ThreadPool<ThreadPoolResult>,
+    submitter: Submitter<ThreadPoolResult>,
     write_stream: DirectStreamWriter<'a>,
 }
 
 impl<'a> Download<'a> {
     pub(super) fn new(
         filepath: String,
-        thread_pool: ThreadPool<ThreadPoolResult>,
+        submitter: Submitter<ThreadPoolResult>,
         write_stream: &'a TcpStream,
     ) -> Self {
         Self {
             filepath,
-            thread_pool,
+            submitter,
             write_stream: DirectStreamWriter {
                 stream: write_stream,
             },
@@ -41,7 +41,7 @@ impl<'a> Download<'a> {
         while idx < size {
             let socket_fd = self.write_stream.await?;
             match self
-                .thread_pool
+                .submitter
                 .submit(move || {
                     #[cfg(target_os = "linux")]
                     {
@@ -107,7 +107,7 @@ impl<'a> Download<'a> {
                             return ThreadPoolResult::Usize(n as usize);
                         }
                     }
-                }).await?
+                }).await
             {
                 ThreadPoolResult::Usize(n) => {
                     idx += n;

@@ -2,8 +2,7 @@ use std::{cell::UnsafeCell, net::SocketAddr, sync::Arc};
 
 use anyhow::anyhow;
 use base64::Engine;
-use bytes::BytesMut;
-use coordinator::pool::automatic::ThreadPool;
+use coordinator::pool::automatic::Submitter;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -16,9 +15,7 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::{
-    db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User},
-};
+use crate::db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User};
 
 use super::{download::Download, upload::Upload};
 
@@ -79,7 +76,7 @@ impl Server {
         let conn_map = data_conn_map.clone();
         tokio::spawn(async move {
             info!("data listener started");
-            let thread_pool = coordinator::pool::Builder::new().scale_size(200).maximum_size(400).queue_size(102400).build_automatic();
+            let thread_pool = coordinator::pool::Builder::new().build();
             loop {
                 let (data_stream, _) = match data_listener.accept().await {
                     Ok(x) => x,
@@ -90,10 +87,10 @@ impl Server {
                 };
 
                 let conn_map = conn_map.clone();
-                let thread_pool = thread_pool.clone();
+                let submitter = thread_pool.new_submitter();
                 tokio::spawn(async move {
                     let (cmd_tx, cmd_rx) = mpsc::channel(32);
-                    let mut data_connection = DataConnection::new(data_stream, cmd_rx, thread_pool);
+                    let mut data_connection = DataConnection::new(data_stream, cmd_rx, submitter);
                     let session_id = data_connection.init().await?;
                     conn_map.insert(session_id, cmd_tx);
 
@@ -141,8 +138,9 @@ impl Request {
     }
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
-        let mut buffer = BytesMut::with_capacity(4096);
+        let mut buffer = Vec::with_capacity(4096);
         unsafe { buffer.set_len(4096) };
+        let buffer = buffer.as_mut_slice();
         let mut curr_user = None;
         loop {
             let op_code = match self.stream.read_u16().await {
@@ -510,7 +508,7 @@ pub(super) enum ThreadPoolResult {
 pub(self) struct DataConnection {
     stream: TcpStream,
     cmd_rx: mpsc::Receiver<Cmd>,
-    thread_pool: ThreadPool<ThreadPoolResult>,
+    submitter: Submitter<ThreadPoolResult>,
     session_id: String,
 }
 
@@ -518,12 +516,12 @@ impl DataConnection {
     pub(self) fn new(
         stream: TcpStream,
         cmd_rx: mpsc::Receiver<Cmd>,
-        thread_pool: ThreadPool<ThreadPoolResult>,
+        submitter: Submitter<ThreadPoolResult>,
     ) -> Self {
         Self {
             stream,
             cmd_rx,
-            thread_pool,
+            submitter,
             session_id: String::new(),
         }
     }
@@ -567,7 +565,7 @@ impl DataConnection {
         Upload::new(
             size,
             filepath.to_owned(),
-            self.thread_pool.clone(),
+            self.submitter.clone(),
             &mut self.stream,
         )
             .run()
@@ -578,7 +576,7 @@ impl DataConnection {
     pub(self) async fn download(&mut self, filepath: &str) -> anyhow::Result<()> {
         Download::new(
             filepath.to_owned(),
-            self.thread_pool.clone(),
+            self.submitter.clone(),
             &mut self.stream,
         )
             .run()

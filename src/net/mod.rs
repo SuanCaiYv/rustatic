@@ -1,6 +1,8 @@
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::{
+    future::Future,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
+};
 
-use futures::Future;
 use tokio::net::TcpStream;
 
 pub(self) mod download;
