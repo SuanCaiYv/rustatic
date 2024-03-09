@@ -12,7 +12,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User};
@@ -146,7 +146,7 @@ impl Request {
             let op_code = match self.stream.read_u16().await {
                 Ok(code) => code,
                 Err(_e) => {
-                    info!("connection closed");
+                    debug!("connection closed");
                     break;
                 }
             };
