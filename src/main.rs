@@ -5,7 +5,6 @@ use tracing::Level;
 
 mod db;
 mod net;
-mod pool;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

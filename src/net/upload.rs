@@ -1,16 +1,16 @@
 use std::{fs::OpenOptions, io::Write, sync::Arc};
 
-use tokio::{io::AsyncReadExt, net::TcpStream, sync::mpsc};
-use tracing::error;
+use coordinator::pool::automatic::Submitter;
 
-use crate::pool::ThreadPool;
+use tokio::{io::AsyncReadExt, net::TcpStream};
+use tracing::error;
 
 use super::server::ThreadPoolResult;
 
 pub(super) struct Upload<'a> {
     size: usize,
     filepath: String,
-    thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+    submitter: Submitter<ThreadPoolResult>,
     read_stream: &'a mut TcpStream,
 }
 
@@ -18,60 +18,54 @@ impl<'a> Upload<'a> {
     pub(super) fn new(
         size: usize,
         filepath: String,
-        thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+        submitter: Submitter<ThreadPoolResult>,
         read_stream: &'a mut TcpStream,
     ) -> Self {
         Self {
             size,
             filepath,
-            thread_pool,
+            submitter,
             read_stream,
         }
     }
 
     pub(super) async fn run(&mut self) -> anyhow::Result<()> {
         let filepath = self.filepath.clone();
-        let (tx, mut rx) = mpsc::channel::<(Arc<Vec<u8>>, usize)>(1);
-        let pool = self.thread_pool.clone();
+        let (tx, rx) = flume::bounded::<(Arc<Vec<u8>>, usize)>(1);
+        let submitter = self.submitter.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = pool
-                .execute_async(
-                    move || {
-                        _ = std::fs::create_dir_all(
-                            std::path::Path::new(filepath.as_str())
-                                .parent()
-                                .unwrap()
-                                .to_str()
-                                .unwrap(),
-                        );
-                        let mut file = OpenOptions::new()
-                            .create_new(true)
-                            .write(true)
-                            .append(true)
-                            .open(filepath.as_str())
-                            .unwrap();
-                        loop {
-                            match rx.blocking_recv() {
-                                Some((content, n)) => {
-                                    if let Err(e) = file.write_all(&content[..n]) {
-                                        error!("write content error: {}", e);
-                                        break;
-                                    }
-                                }
-                                None => {
-                                    break;
-                                }
+            submitter.submit(move || {
+                _ = std::fs::create_dir_all(
+                    std::path::Path::new(filepath.as_str())
+                        .parent()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                );
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .append(true)
+                    .open(filepath.as_str())
+                    .unwrap();
+                loop {
+                    match rx.recv() {
+                        Ok((content, n)) => {
+                            if let Err(e) = file.write_all(&content[..n]) {
+                                error!("write content error: {}", e);
+                                break;
                             }
                         }
-                        file.sync_all().unwrap();
-                        return ThreadPoolResult::None;
-                    },
-                )
-                .await
-            {
-                error!("task send error: {}", e);
-            }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+                file.sync_all().unwrap();
+                return ThreadPoolResult::None;
+            })
+            .await
         });
 
         let buffer1 = Arc::new(vec![0u8; 1024 * 16]);
@@ -93,7 +87,7 @@ impl<'a> Upload<'a> {
                 break;
             }
             self.size -= n;
-            if let Err(e) = tx.send((buffer_arr[idx % 3].clone(), n)).await {
+            if let Err(e) = tx.send_async((buffer_arr[idx % 3].clone(), n)).await {
                 error!("disk operation error: {}", e);
                 break;
             }

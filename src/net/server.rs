@@ -2,7 +2,7 @@ use std::{cell::UnsafeCell, net::SocketAddr, sync::Arc};
 
 use anyhow::anyhow;
 use base64::Engine;
-use bytes::BytesMut;
+use coordinator::pool::automatic::Submitter;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -12,13 +12,10 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{
-    db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User},
-    pool::ThreadPool,
-};
+use crate::db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User};
 
 use super::{download::Download, upload::Upload};
 
@@ -65,13 +62,13 @@ impl Server {
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let data_listener = TcpListener::bind(
             format!("0.0.0.0:{}", data_port)
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
         let data_conn_map = Arc::new(DashMap::new());
@@ -79,7 +76,7 @@ impl Server {
         let conn_map = data_conn_map.clone();
         tokio::spawn(async move {
             info!("data listener started");
-            let thread_pool = Arc::new(ThreadPool::new(24, 180, 20));
+            let thread_pool = coordinator::pool::Builder::new().build();
             loop {
                 let (data_stream, _) = match data_listener.accept().await {
                     Ok(x) => x,
@@ -90,10 +87,10 @@ impl Server {
                 };
 
                 let conn_map = conn_map.clone();
-                let thread_pool = thread_pool.clone();
+                let submitter = thread_pool.new_submitter();
                 tokio::spawn(async move {
                     let (cmd_tx, cmd_rx) = mpsc::channel(32);
-                    let mut data_connection = DataConnection::new(data_stream, cmd_rx, thread_pool);
+                    let mut data_connection = DataConnection::new(data_stream, cmd_rx, submitter);
                     let session_id = data_connection.init().await?;
                     conn_map.insert(session_id, cmd_tx);
 
@@ -141,14 +138,15 @@ impl Request {
     }
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
-        let mut buffer = BytesMut::with_capacity(4096);
+        let mut buffer = Vec::with_capacity(4096);
         unsafe { buffer.set_len(4096) };
+        let buffer = buffer.as_mut_slice();
         let mut curr_user = None;
         loop {
             let op_code = match self.stream.read_u16().await {
                 Ok(code) => code,
-                Err(e) => {
-                    warn!("read request error: {}", e);
+                Err(_e) => {
+                    debug!("connection closed");
                     break;
                 }
             };
@@ -171,6 +169,7 @@ impl Request {
                 }
             };
             match op_code {
+                // sign
                 1 => {
                     let params = Self::parse1(content)?;
                     curr_user = Some(params.0.clone());
@@ -179,7 +178,6 @@ impl Request {
                         self.stream
                             .write_all(format!("err {}\n", e.to_string()).as_bytes())
                             .await?;
-                        break;
                     }
                     let uuid = Uuid::new_v4().to_string();
                     let engine = base64::engine::GeneralPurpose::new(
@@ -191,12 +189,12 @@ impl Request {
                         .write_all(format!("ok {}\n", session_id).as_bytes())
                         .await?;
                 }
+                // login
                 2 => {
                     let params = Self::parse1(content)?;
                     if let Some(ref curr_user) = curr_user {
                         if curr_user != &params.0 {
                             error!("user not match");
-                            break;
                         }
                     } else {
                         curr_user = Some(params.0.clone());
@@ -206,7 +204,6 @@ impl Request {
                         self.stream
                             .write_all(format!("err {}\n", e.to_string()).as_bytes())
                             .await?;
-                        break;
                     }
                     let uuid = Uuid::new_v4().to_string();
                     let engine = base64::engine::GeneralPurpose::new(
@@ -218,6 +215,7 @@ impl Request {
                         .write_all(format!("ok {}\n", session_id).as_bytes())
                         .await?;
                 }
+                // upload
                 3 => {
                     let params = match serde_json::from_slice::<serde_json::Value>(content) {
                         Ok(entry) => {
@@ -300,6 +298,7 @@ impl Request {
                         }
                     }
                 }
+                // download
                 4 => {
                     let (session_id, link) = Self::parse2(content)?;
                     let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await {
@@ -319,7 +318,7 @@ impl Request {
                         Some(cmd_tx) => {
                             cmd_tx.send(Cmd::Download(metadata.filepath)).await?;
                             self.stream
-                                .write_all(format!("ok {}\n", metadata.filename).as_bytes())
+                                .write_all(format!("ok {} {}\n", metadata.filename, metadata.size).as_bytes())
                                 .await?;
                         }
                         None => {
@@ -349,11 +348,44 @@ impl Request {
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
                             cmd_tx
-                                .send(Cmd::DownloadDirectly(metadata.filepath))
+                                .send(Cmd::DownloadDirectly(metadata.filepath, metadata.size as usize))
+                                .await?;
+                            self.stream
+                                .write_all(format!("ok {} {}\n", metadata.filename, metadata.size).as_bytes())
                                 .await?;
                         }
                         None => {
                             error!("session id not found");
+                            self.stream
+                                .write_all(format!("err {}\n", "bad session_id").as_bytes())
+                                .await?;
+                            break;
+                        }
+                    }
+                }
+                6 => {
+                    let username = String::from_utf8_lossy(&content[0..req_len as usize]);
+                    match get_metadata_ops().await.list_by_owner(username.to_string()).await {
+                        Ok(res) => {
+                            let mut res_str = String::new();
+                            for metadata in res {
+                                res_str.push_str(&format!(
+                                    "{} {} {} {} {} {} ",
+                                    metadata.filename,
+                                    metadata.size,
+                                    metadata.create_time,
+                                    metadata.update_time,
+                                    metadata.delete_time,
+                                    metadata.link
+                                ));
+                            }
+                            self.stream.write_all(format!("ok {}\n", res_str).as_bytes()).await?;
+                        }
+                        Err(e) => {
+                            error!("list metadata error: {}", e);
+                            self.stream
+                                .write_all(format!("err {}\n", "list files failed").as_bytes())
+                                .await?;
                             break;
                         }
                     }
@@ -476,7 +508,7 @@ pub(super) enum ThreadPoolResult {
 pub(self) struct DataConnection {
     stream: TcpStream,
     cmd_rx: mpsc::Receiver<Cmd>,
-    thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+    submitter: Submitter<ThreadPoolResult>,
     session_id: String,
 }
 
@@ -484,12 +516,12 @@ impl DataConnection {
     pub(self) fn new(
         stream: TcpStream,
         cmd_rx: mpsc::Receiver<Cmd>,
-        thread_pool: Arc<ThreadPool<ThreadPoolResult>>,
+        submitter: Submitter<ThreadPoolResult>,
     ) -> Self {
         Self {
             stream,
             cmd_rx,
-            thread_pool,
+            submitter,
             session_id: String::new(),
         }
     }
@@ -519,8 +551,8 @@ impl DataConnection {
                 Some(cmd) => match cmd {
                     Cmd::Upload(filename, size) => self.upload(filename.as_str(), size).await?,
                     Cmd::Download(filename) => self.download(filename.as_str()).await?,
-                    Cmd::DownloadDirectly(filename) => {
-                        self.download_directly(filename.as_str()).await?
+                    Cmd::DownloadDirectly(filename, size) => {
+                        self.download_directly(filename.as_str(), size).await?
                     }
                 },
                 None => break,
@@ -533,39 +565,45 @@ impl DataConnection {
         Upload::new(
             size,
             filepath.to_owned(),
-            self.thread_pool.clone(),
+            self.submitter.clone(),
             &mut self.stream,
         )
-        .run()
-        .await?;
+            .run()
+            .await?;
         Ok(())
     }
 
     pub(self) async fn download(&mut self, filepath: &str) -> anyhow::Result<()> {
         Download::new(
             filepath.to_owned(),
-            self.thread_pool.clone(),
+            self.submitter.clone(),
             &mut self.stream,
         )
-        .run()
-        .await?;
+            .run()
+            .await?;
         Ok(())
     }
 
-    pub(self) async fn download_directly(&mut self, filepath: &str) -> anyhow::Result<()> {
+    pub(self) async fn download_directly(&mut self, filepath: &str, size: usize) -> anyhow::Result<()> {
         let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .append(true)
+            .read(true)
+            .write(false)
             .open(filepath)
             .await
             .unwrap();
-        let mut buffer = BytesMut::with_capacity(4096 * 4);
+        let mut buffer = Vec::with_capacity(1024 * 1024 * 8);
+        unsafe {
+            buffer.set_len(1024 * 1024 * 8)
+        };
+        let buffer = buffer.as_mut_slice();
+        let mut total = 0;
         loop {
-            let n = file.read(&mut buffer).await?;
-            if n == 0 {
+            let n = file.read(&mut buffer[..]).await?;
+            total += n;
+            self.stream.write_all(&buffer[..n]).await?;
+            if total == size {
                 break;
             }
-            self.stream.write_all(&buffer[..n]).await?;
         }
         Ok(())
     }
@@ -574,7 +612,7 @@ impl DataConnection {
 pub(self) enum Cmd {
     Upload(String, usize),
     Download(String),
-    DownloadDirectly(String),
+    DownloadDirectly(String, usize),
 }
 
 pub(super) struct UnsafePlaceholder<T> {
