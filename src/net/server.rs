@@ -91,7 +91,12 @@ impl Server {
                 tokio::spawn(async move {
                     let (cmd_tx, cmd_rx) = mpsc::channel(32);
                     let mut data_connection = DataConnection::new(data_stream, cmd_rx, submitter);
-                    let session_id = data_connection.init().await?;
+                    let session_id = data_connection.init().await;
+                    if session_id.is_err() {
+                        error!("data connection init error: {}", session_id.err().unwrap());
+                        return Err(anyhow!("data connection init error"))
+                    }
+                    let session_id = session_id.unwrap();
                     conn_map.insert(session_id, cmd_tx);
 
                     if let Err(e) = data_connection.handle().await {
@@ -106,7 +111,12 @@ impl Server {
         info!("ctrl listener started");
         let root_folder: &'static str = Box::leak(root_folder.into_boxed_str());
         while let Ok((stream, _)) = ctrl_listener.accept().await {
-            let stream = acceptor.accept(stream).await?;
+            let stream = acceptor.accept(stream).await;
+            if stream.is_err() {
+                error!("tls accept error: {}", stream.err().unwrap());
+                continue;
+            }
+            let stream = stream.unwrap();
             let mut request = Request::new(stream, data_conn_map.clone(), root_folder);
             tokio::spawn(async move {
                 if let Err(e) = request.handle().await {
