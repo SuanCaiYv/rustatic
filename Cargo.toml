@@ -26,4 +26,5 @@ base64 = "0.21.4"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+structopt = "0.3.26"
 coordinator = { git = "https://github.com/SuanCaiYv/coordinator"}
