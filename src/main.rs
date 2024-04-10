@@ -13,11 +13,30 @@ struct Opt {
     #[structopt(short = "r", long, default_value = "")]
     /// the file root folder
     root: String,
+    #[structopt(short = "l", long, default_value = "info")]
+    log: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::from_args();
+    let log_level = match opt.log.as_str() {
+        "info" | "i" => {
+            Level::INFO
+        },
+        "warn" | "w" => {
+            Level::WARN
+        },
+        "debug" | "d" => {
+            Level::DEBUG
+        }
+        "error" | "e" => {
+            Level::ERROR
+        }
+        _ => {
+            Level::INFO
+        },
+    };
     tracing_subscriber::fmt()
         .event_format(
             tracing_subscriber::fmt::format()
@@ -25,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_level(true)
                 .with_target(true),
         )
-        .with_max_level(Level::INFO)
+        .with_max_level(log_level)
         .try_init()
         .unwrap();
     let server_config = ServerConfig {
@@ -42,6 +61,6 @@ async fn main() -> anyhow::Result<()> {
             opt.root.clone()
         },
     };
-    println!("{}", server_config.root_folder);
+    println!("Save file in 👉{}👈", server_config.root_folder);
     Server::new(server_config).run().await
 }

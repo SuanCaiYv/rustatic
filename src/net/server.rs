@@ -270,6 +270,12 @@ impl Request {
                         curr_user.as_ref().unwrap(),
                         filename
                     );
+                    let mut tag = 0;
+                    if let Ok(same_name_record) = get_metadata_ops().await.get_by_owner_filename(curr_user.clone().unwrap(), filename.clone()).await {
+                        if let Some(record) = same_name_record {
+                            tag = record.duplication + 1;
+                        }
+                    }
                     let metadata = Metadata {
                         id: 0,
                         filename: filename.clone(),
@@ -282,6 +288,7 @@ impl Request {
                         permissions: "private".to_owned(),
                         r#type: "".to_owned(),
                         classification: "".to_owned(),
+                        duplication: tag,
                         create_time: chrono::Local::now().timestamp_millis(),
                         update_time: chrono::Local::now().timestamp_millis(),
                         delete_time: 0,
@@ -340,6 +347,7 @@ impl Request {
                         }
                     }
                 }
+                // download directly by stream transmit
                 5 => {
                     let (session_id, link) = Self::parse2(content)?;
                     let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await {
@@ -373,6 +381,7 @@ impl Request {
                         }
                     }
                 }
+                // list files
                 6 => {
                     let username = String::from_utf8_lossy(&content[0..req_len as usize]);
                     match get_metadata_ops().await.list_by_owner(username.to_string()).await {
@@ -380,9 +389,10 @@ impl Request {
                             let mut res_str = String::new();
                             for metadata in res {
                                 res_str.push_str(&format!(
-                                    "{} {} {} {} {} {} ",
+                                    "{} {} {} {} {} {} {} ",
                                     metadata.filename,
                                     metadata.size,
+                                    metadata.duplication,
                                     metadata.create_time,
                                     metadata.update_time,
                                     metadata.delete_time,
@@ -400,6 +410,14 @@ impl Request {
                         }
                     }
                 }
+                // rename file
+                7 => {}
+                // delete file(hide file for 30 days)
+                8 => {}
+                // restore file
+                9 => {}
+                // confirm delete file
+                10 => {}
                 _ => {
                     error!("unknown op code: {}", op_code);
                     break;
