@@ -27,4 +27,5 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 structopt = "0.3.26"
+byteorder = "1.5.0"
 coordinator = { git = "https://github.com/SuanCaiYv/coordinator"}

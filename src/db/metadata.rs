@@ -259,8 +259,12 @@ impl MetadataDB {
         }).await?;
         Ok(res)
     }
-    
-    pub(crate) async fn get_by_owner_filename(&self, owner: String, filename: String) -> anyhow::Result<Option<Metadata>> {
+
+    pub(crate) async fn get_by_owner_filename(
+        &self,
+        owner: String,
+        filename: String,
+    ) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
             let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND filename = ?2 ORDER BY duplication DESC LIMIT 1")?;
             let mut res = statement
