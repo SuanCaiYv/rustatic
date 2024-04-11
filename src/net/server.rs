@@ -1,4 +1,10 @@
-use std::{cell::UnsafeCell, net::SocketAddr, sync::Arc};
+use std::{
+    cell::UnsafeCell,
+    net::SocketAddr,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 use base64::Engine;
@@ -16,11 +22,15 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User};
+use crate::{
+    db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User},
+    net::rename::Rename,
+};
 
 use super::{download::Download, upload::Upload};
 
 pub(self) const ALPN_RUSTATIC: &[&[u8]] = &[b"rustatic"];
+pub(self) const SPLIT_FIELD_LENGTH: usize = 2;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -149,12 +159,10 @@ impl Request {
     }
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
-        let mut buffer = Vec::with_capacity(4096);
-        unsafe { buffer.set_len(4096) };
-        let buffer = buffer.as_mut_slice();
+        let buffer = UnsafeBuffer::new(4096);
         let mut curr_user: Option<String> = None;
         loop {
-            let (op_code, req) = match self.read_req(buffer).await {
+            let (op_code, req) = match self.read_req(&buffer).await {
                 Ok(res) => res,
                 Err(_e) => {
                     break;
@@ -168,7 +176,7 @@ impl Request {
                     curr_user = Some(username.clone());
                     if let Err(e) = Self::sign(&username, &password).await {
                         error!("sign error: {}", e);
-                        self.write_resp(Some(format!("err {}\n", e.to_string())), vec![])
+                        self.write_resp(Some(e.to_string().as_str()), vec![])
                             .await?;
                     }
                     let uuid = Uuid::new_v4().to_string();
@@ -183,11 +191,11 @@ impl Request {
                 2 => {
                     let username = String::from_utf8_lossy(req[0]).to_string();
                     let password = String::from_utf8_lossy(req[1]).to_string();
+                    // check for allow multiple login to enable more streams with purpose of concurrent transit.
                     if let Some(ref curr_user) = curr_user {
                         if curr_user != &username {
                             error!("user not match");
-                            self.write_resp(Some("user not match".to_string()), vec![])
-                                .await?;
+                            self.write_resp(Some("user not match"), vec![]).await?;
                             continue;
                         }
                     } else {
@@ -195,7 +203,7 @@ impl Request {
                     }
                     if let Err(e) = Self::login(&username, &password).await {
                         error!("login error: {}", e);
-                        self.write_resp(Some(format!("err {}\n", e.to_string())), vec![])
+                        self.write_resp(Some(e.to_string().as_str()), vec![])
                             .await?;
                         continue;
                     }
@@ -274,8 +282,7 @@ impl Request {
                     if flag {
                         self.write_resp(None, vec![link.as_bytes()]).await?;
                     } else {
-                        self.write_resp(Some(format!("err {}\n", "bad session_id")), vec![])
-                            .await?;
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
                     }
                 }
                 // download
@@ -287,8 +294,7 @@ impl Request {
                             Some(v) => v,
                             None => {
                                 error!("metadata not found");
-                                self.write_resp(Some("file not found".to_string()), vec![])
-                                    .await?;
+                                self.write_resp(Some("file not found"), vec![]).await?;
                                 continue;
                             }
                         },
@@ -313,8 +319,7 @@ impl Request {
                         self.write_resp(None, vec![metadata.filename.as_bytes(), &data[..]])
                             .await?;
                     } else {
-                        self.write_resp(Some(format!("err {}\n", "bad session_id")), vec![])
-                            .await?;
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
                     }
                 }
                 // download directly by stream transmit
@@ -326,8 +331,7 @@ impl Request {
                             Some(v) => v,
                             None => {
                                 error!("metadata not found");
-                                self.write_resp(Some("file not found".to_string()), vec![])
-                                    .await?;
+                                self.write_resp(Some("file not found"), vec![]).await?;
                                 continue;
                             }
                         },
@@ -357,8 +361,7 @@ impl Request {
                         self.write_resp(None, vec![metadata.filename.as_bytes(), &data[..]])
                             .await?;
                     } else {
-                        self.write_resp(Some(format!("err {}\n", "bad session_id")), vec![])
-                            .await?;
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
                     }
                 }
                 // list files
@@ -370,23 +373,40 @@ impl Request {
                         .await
                     {
                         Ok(res) => {
-                            let mut buf = Vec::with_capacity(8 * 5 * res.len());
-                            unsafe {
-                                buf.set_len(8 * 5 * res.len());
-                            }
-                            let buf = buf.as_mut_slice();
+                            let buf = UnsafeBuffer::new(8 * 5 * res.len());
                             let mut idx = 0;
                             let mut data = vec![];
                             for m in res.iter() {
-                                byteorder::BigEndian::write_i64(& mut buf[idx..idx+8], m.size);
+                                data.push(m.filename.as_bytes());
+                                byteorder::BigEndian::write_i64(
+                                    buf.get_mut_slice(idx..idx + 8),
+                                    m.size,
+                                );
+                                data.push(buf.get_slice(idx..idx + 8));
                                 idx += 8;
-                                byteorder::BigEndian::write_i64(& mut buf[idx..idx+8], m.duplication);
+                                byteorder::BigEndian::write_i64(
+                                    buf.get_mut_slice(idx..idx + 8),
+                                    m.duplication,
+                                );
+                                data.push(buf.get_slice(idx..idx + 8));
                                 idx += 8;
-                                byteorder::BigEndian::write_i64(& mut buf[idx..idx+8], m.create_time);
+                                byteorder::BigEndian::write_i64(
+                                    buf.get_mut_slice(idx..idx + 8),
+                                    m.create_time,
+                                );
+                                data.push(buf.get_slice(idx..idx + 8));
                                 idx += 8;
-                                byteorder::BigEndian::write_i64(& mut buf[idx..idx+8], m.update_time);
+                                byteorder::BigEndian::write_i64(
+                                    buf.get_mut_slice(idx..idx + 8),
+                                    m.update_time,
+                                );
+                                data.push(buf.get_slice(idx..idx + 8));
                                 idx += 8;
-                                byteorder::BigEndian::write_i64(& mut buf[idx..idx+8], m.delete_time);
+                                byteorder::BigEndian::write_i64(
+                                    buf.get_mut_slice(idx..idx + 8),
+                                    m.delete_time,
+                                );
+                                data.push(buf.get_slice(idx..idx + 8));
                                 idx += 8;
                                 data.push(m.link.as_bytes());
                             }
@@ -394,14 +414,82 @@ impl Request {
                         }
                         Err(e) => {
                             error!("list metadata error: {}", e);
-                            self.write_resp(Some(format!("err {}\n", "list files failed")), vec![])
-                                .await?;
+                            self.write_resp(Some("list files failed"), vec![]).await?;
                             break;
                         }
                     }
                 }
                 // rename file
-                7 => {}
+                7 => {
+                    let session_id = String::from_utf8_lossy(req[0]).to_string();
+                    let link = String::from_utf8_lossy(req[1]).to_string();
+                    let new_name = String::from_utf8_lossy(req[2]).to_string();
+                    let mut metadata =
+                        match get_metadata_ops().await.get_by_link(link.clone()).await {
+                            Ok(res) => match res {
+                                Some(v) => v,
+                                None => {
+                                    error!("metadata not found");
+                                    self.write_resp(Some("file not found"), vec![]).await?;
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                error!("get metadata error: {}", e);
+                                break;
+                            }
+                        };
+                    match get_metadata_ops()
+                        .await
+                        .get_by_owner_filename(curr_user.clone().unwrap(), new_name.clone())
+                        .await
+                    {
+                        Ok(res) => match res {
+                            Some(_v) => {
+                                error!("same file name already existed");
+                                self.write_resp(
+                                    Some("same name for new filename already existed"),
+                                    vec![],
+                                )
+                                .await?;
+                                continue;
+                            }
+                            None => {}
+                        },
+                        Err(e) => {
+                            error!("get metadata error: {}", e);
+                            break;
+                        }
+                    };
+                    let path = Path::new(metadata.filepath.as_str());
+                    let dir_path = path.parent().unwrap_or_else(|| Path::new(""));
+                    let new_filepath = dir_path
+                        .join(new_name.clone())
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+
+                    let mut flag = false;
+                    match self.cmd_map.get(session_id.as_str()) {
+                        Some(cmd_tx) => {
+                            cmd_tx
+                                .send(Cmd::Rename(metadata.filepath, new_filepath.clone()))
+                                .await?;
+                            flag = true;
+                        }
+                        None => {
+                            error!("session id not found");
+                        }
+                    }
+                    if flag {
+                        metadata.filename = new_name;
+                        metadata.filepath = new_filepath;
+                        get_metadata_ops().await.update(metadata).await?;
+                        self.write_resp(None, vec![]).await?;
+                    } else {
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
+                    }
+                }
                 // delete file(hide file for 30 days)
                 8 => {}
                 // restore file
@@ -419,7 +507,7 @@ impl Request {
 
     pub(self) async fn write_resp(
         &mut self,
-        e: Option<String>,
+        e: Option<&str>,
         resp: Vec<&[u8]>,
     ) -> anyhow::Result<()> {
         let mut len = 0;
@@ -433,14 +521,20 @@ impl Request {
             len += 2; // err_str field encode length
             len += e.as_bytes().len(); // `err_str`` length
             self.stream.write_u16(len as u16).await?;
-            self.stream.write_all("err".as_bytes()).await?;
+            self.stream.write_u16(3).await?; // length of `err`
+            self.stream
+                .write_all(['e' as u8, 'r' as u8, 'r' as u8].as_slice())
+                .await?;
             self.stream.write_u16(e.as_bytes().len() as u16).await?;
             self.stream.write_all(e.as_bytes()).await?;
         } else {
             len += 2; // ok field encode length
             len += 2; // `ok` length
             self.stream.write_u16(len as u16).await?;
-            self.stream.write_all("ok".as_bytes()).await?;
+            self.stream.write_u16(2).await?; // length of `ok`
+            self.stream
+                .write_all(['o' as u8, 'k' as u8].as_slice())
+                .await?;
         }
         for r in resp.iter() {
             self.stream.write_u16(r.len() as u16).await?;
@@ -451,27 +545,26 @@ impl Request {
 
     pub(self) async fn read_req<'a>(
         &mut self,
-        buffer: &'a mut [u8],
+        buffer: &'a UnsafeBuffer,
     ) -> anyhow::Result<(u16, Vec<&'a [u8]>)> {
         let op_code = match self.stream.read_u16().await {
             Ok(code) => code,
-            Err(e) => {
+            Err(_e) => {
                 debug!("connection closed");
                 return Err(anyhow!(""));
             }
         };
-        let len = self.stream.read_u16().await? as usize;
-        self.stream.read_exact(&mut buffer[..len]).await?;
-        let mut res = vec![];
+        let mut len = self.stream.read_u16().await? as usize;
+
+        let mut res = Vec::new();
         let mut idx = 0;
-        loop {
-            let size = byteorder::BigEndian::read_u16(&buffer[idx..]) as usize;
-            res.push(&buffer[idx + 2..idx + 2 + size]);
-            idx += 2;
+        while len > 0 {
+            let size = self.stream.read_u16().await? as usize;
+            let data = buffer.get_mut_slice(idx..idx + size);
+            self.stream.read_exact(data).await?;
+            res.push(buffer.get_slice(idx..idx + size));
             idx += size;
-            if idx == len {
-                break;
-            }
+            len -= SPLIT_FIELD_LENGTH + size;
         }
         return Ok((op_code, res));
     }
@@ -579,14 +672,12 @@ impl DataConnection {
         loop {
             match self.cmd_rx.recv().await {
                 Some(cmd) => match cmd {
-                    Cmd::Upload(filepath, size) => self.upload(filepath.as_str(), size).await?,
-                    Cmd::Download(filepath) => self.download(filepath.as_str()).await?,
+                    Cmd::Upload(filepath, size) => self.upload(filepath, size).await?,
+                    Cmd::Download(filepath) => self.download(filepath).await?,
                     Cmd::DownloadDirectly(filepath, size) => {
-                        self.download_directly(filepath.as_str(), size).await?
+                        self.download_directly(filepath, size).await?
                     }
-                    Cmd::Rename(filepath, new_name) => {
-                        self.rename(filepath.as_str(), new_name.as_str()).await?
-                    }
+                    Cmd::Rename(filepath, new_name) => self.rename(filepath, new_name).await?,
                     Cmd::DeleteFalsely(filepath) => self.delete_falsely(filepath.as_str()).await?,
                     Cmd::DeleteImmediately(filepath) => {
                         self.delete_immediately(filepath.as_str()).await?
@@ -598,7 +689,7 @@ impl DataConnection {
         Ok(())
     }
 
-    pub(self) async fn upload(&mut self, filepath: &str, size: usize) -> anyhow::Result<()> {
+    pub(self) async fn upload(&mut self, filepath: String, size: usize) -> anyhow::Result<()> {
         Upload::new(
             size,
             filepath.to_owned(),
@@ -610,7 +701,7 @@ impl DataConnection {
         Ok(())
     }
 
-    pub(self) async fn download(&mut self, filepath: &str) -> anyhow::Result<()> {
+    pub(self) async fn download(&mut self, filepath: String) -> anyhow::Result<()> {
         Download::new(
             filepath.to_owned(),
             self.submitter.clone(),
@@ -623,7 +714,7 @@ impl DataConnection {
 
     pub(self) async fn download_directly(
         &mut self,
-        filepath: &str,
+        filepath: String,
         size: usize,
     ) -> anyhow::Result<()> {
         let mut file = tokio::fs::OpenOptions::new()
@@ -647,8 +738,10 @@ impl DataConnection {
         Ok(())
     }
 
-    pub(self) async fn rename(&mut self, filepath: &str, new_name: &str) -> anyhow::Result<()> {
-        todo!("")
+    pub(self) async fn rename(&mut self, filepath: String, new_name: String) -> anyhow::Result<()> {
+        Rename::new(filepath, new_name, self.submitter.clone())
+            .run()
+            .await
     }
 
     pub(self) async fn delete_falsely(&mut self, filepath: &str) -> anyhow::Result<()> {
@@ -697,3 +790,32 @@ impl<T> UnsafePlaceholder<T> {
 unsafe impl<T> Send for UnsafePlaceholder<T> {}
 
 unsafe impl<T> Sync for UnsafePlaceholder<T> {}
+
+pub(self) struct UnsafeBuffer {
+    data: Vec<u8>,
+}
+
+impl UnsafeBuffer {
+    pub(self) fn new(capacity: usize) -> Self {
+        let mut data = Vec::with_capacity(capacity);
+        unsafe {
+            data.set_len(capacity);
+        }
+        UnsafeBuffer { data }
+    }
+
+    pub(self) fn get_mut_slice(&self, index: Range<usize>) -> &mut [u8] {
+        let range = index.start..index.end;
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.data.as_ptr().add(index.start) as *mut _,
+                range.len(),
+            )
+        }
+    }
+
+    pub(self) fn get_slice(&self, index: Range<usize>) -> &[u8] {
+        let range = index.start..index.end;
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr().add(index.start), range.len()) }
+    }
+}
