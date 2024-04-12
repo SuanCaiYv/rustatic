@@ -19,6 +19,7 @@ pub(self) const DB_CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS metadata (
     permissions       TEXT,
     type              TEXT,
     classification    TEXT,
+    dup_identifier    TEXT,
     duplication       INTEGER,
     create_time       INTEGER,
     update_time       INTEGER,
@@ -39,6 +40,7 @@ pub(crate) struct Metadata {
     pub(crate) permissions: String,
     pub(crate) r#type: String,
     pub(crate) classification: String,
+    pub(crate) dup_identifier: String,
     pub(crate) duplication: i64,
     pub(crate) create_time: i64,
     pub(crate) update_time: i64,
@@ -84,7 +86,7 @@ impl MetadataDB {
             .call(move |conn| {
                 let mut stmt = conn
                     .prepare(
-                        "INSERT INTO metadata (filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        "INSERT INTO metadata (filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     )
                     .unwrap();
                 stmt.execute(params![
@@ -98,6 +100,7 @@ impl MetadataDB {
                     metadata.permissions,
                     metadata.r#type,
                     metadata.classification,
+                    metadata.dup_identifier,
                     metadata.duplication,
                     metadata.create_time,
                     metadata.update_time,
@@ -117,7 +120,7 @@ impl MetadataDB {
             .call(move |conn| {
                 let mut stmt = conn
                     .prepare(
-                        "UPDATE metadata SET filename = ?1, owner = ?2, link = ?3, size = ?4, sha256 = ?5, filepath = ?6, encrypt_key = ?7, permissions = ?8, type = ?9, classification = ?10, duplication = ?11, create_time = ?12, update_time = ?13, delete_time = ?14 WHERE id = ?15",
+                        "UPDATE metadata SET filename = ?1, owner = ?2, link = ?3, size = ?4, sha256 = ?5, filepath = ?6, encrypt_key = ?7, permissions = ?8, type = ?9, classification = ?10, dup_identifier = ?11, duplication = ?12, create_time = ?13, update_time = ?14, delete_time = ?15 WHERE id = ?16",
                     )
                     .unwrap();
                 stmt.execute(params![
@@ -131,6 +134,7 @@ impl MetadataDB {
                     metadata.permissions,
                     metadata.r#type,
                     metadata.classification,
+                    metadata.dup_identifier,
                     metadata.duplication,
                     metadata.create_time,
                     metadata.update_time,
@@ -164,11 +168,8 @@ impl MetadataDB {
     pub(crate) async fn remove(&self, id: i64) -> anyhow::Result<()> {
         self.conn
             .call(move |conn| {
-                let mut stmt = conn
-                    .prepare("DELETE FROM metadata WHERE id = ?1")
-                    .unwrap();
-                stmt.execute(params![id])
-                    .unwrap();
+                let mut stmt = conn.prepare("DELETE FROM metadata WHERE id = ?1").unwrap();
+                stmt.execute(params![id]).unwrap();
                 Ok::<(), rusqlite::Error>(())
             })
             .await
@@ -179,7 +180,7 @@ impl MetadataDB {
     #[allow(unused)]
     pub(crate) async fn get(&self, id: i64) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE id = ?1")?;
+            let mut statement = conn.prepare("SELECT filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time FROM metadata WHERE id = ?1")?;
             let mut res = statement
                 .query_map(params![id], |row| {
                     let metadata = Metadata {
@@ -194,10 +195,11 @@ impl MetadataDB {
                         permissions: row.get(7)?,
                         r#type: row.get(8)?,
                         classification: row.get(9)?,
-                        duplication: row.get(10)?,
-                        create_time: row.get(11)?,
-                        update_time: row.get(12)?,
-                        delete_time: row.get(13)?,
+                        dup_identifier: row.get(10)?,
+                        duplication: row.get(11)?,
+                        create_time: row.get(12)?,
+                        update_time: row.get(13)?,
+                        delete_time: row.get(14)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?
@@ -213,7 +215,7 @@ impl MetadataDB {
 
     pub(crate) async fn get_by_link(&self, link: String) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE link = ?1")?;
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time FROM metadata WHERE link = ?1")?;
             let mut res = statement
                 .query_map(params![link], |row| {
                     let metadata = Metadata {
@@ -228,6 +230,7 @@ impl MetadataDB {
                         permissions: row.get(8)?,
                         r#type: row.get(9)?,
                         classification: row.get(10)?,
+                        dup_identifier: row.get(10)?,
                         duplication: row.get(11)?,
                         create_time: row.get(12)?,
                         update_time: row.get(13)?,
@@ -247,7 +250,7 @@ impl MetadataDB {
 
     pub(crate) async fn list_by_owner(&self, owner: String) -> anyhow::Result<Vec<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1")?;
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1")?;
             let res = statement
                 .query_map(params![owner], |row| {
                     let metadata = Metadata {
@@ -262,15 +265,55 @@ impl MetadataDB {
                         permissions: row.get(8)?,
                         r#type: row.get(9)?,
                         classification: row.get(10)?,
-                        duplication: row.get(11)?,
-                        create_time: row.get(12)?,
-                        update_time: row.get(13)?,
-                        delete_time: row.get(14)?,
+                        dup_identifier: row.get(11)?,
+                        duplication: row.get(12)?,
+                        create_time: row.get(13)?,
+                        update_time: row.get(14)?,
+                        delete_time: row.get(15)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?
                 .collect::<Result<Vec<Metadata>, rusqlite::Error>>()?;
             Ok::<Vec<Metadata>, rusqlite::Error>(res)
+        }).await?;
+        Ok(res)
+    }
+
+    pub(crate) async fn get_by_owner_dup_identifier(
+        &self,
+        owner: String,
+        dup_identifier: String,
+    ) -> anyhow::Result<Option<Metadata>> {
+        let res = self.conn.call(move |conn| {
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND dup_identifier like ?2 ORDER BY duplication DESC LIMIT 1")?;
+            let mut res = statement
+                .query_map(params![owner, dup_identifier], |row| {
+                    let metadata = Metadata {
+                        id: row.get(0)?,
+                        filename: row.get(1)?,
+                        owner: row.get(2)?,
+                        link: row.get(3)?,
+                        size: row.get(4)?,
+                        sha256: row.get(5)?,
+                        filepath: row.get(6)?,
+                        encrypt_key: row.get(7)?,
+                        permissions: row.get(8)?,
+                        r#type: row.get(9)?,
+                        classification: row.get(10)?,
+                        dup_identifier: row.get(11)?,
+                        duplication: row.get(12)?,
+                        create_time: row.get(13)?,
+                        update_time: row.get(14)?,
+                        delete_time: row.get(15)?,
+                    };
+                    Ok::<Metadata, rusqlite::Error>(metadata)
+                })?
+                .collect::<Result<Vec<Metadata>, rusqlite::Error>>()?;
+            if res.len() == 0 {
+                Ok::<Option<Metadata>, rusqlite::Error>(None)
+            } else {
+                Ok::<Option<Metadata>, rusqlite::Error>(Some(res.remove(0)))
+            }
         }).await?;
         Ok(res)
     }
@@ -281,7 +324,7 @@ impl MetadataDB {
         filename: String,
     ) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND filename = ?2 ORDER BY duplication DESC LIMIT 1")?;
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND filename like ?2 ORDER BY duplication DESC LIMIT 1")?;
             let mut res = statement
                 .query_map(params![owner, filename], |row| {
                     let metadata = Metadata {
@@ -296,10 +339,11 @@ impl MetadataDB {
                         permissions: row.get(8)?,
                         r#type: row.get(9)?,
                         classification: row.get(10)?,
-                        duplication: row.get(11)?,
-                        create_time: row.get(12)?,
-                        update_time: row.get(13)?,
-                        delete_time: row.get(14)?,
+                        dup_identifier: row.get(11)?,
+                        duplication: row.get(12)?,
+                        create_time: row.get(13)?,
+                        update_time: row.get(14)?,
+                        delete_time: row.get(15)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?
@@ -318,7 +362,7 @@ impl MetadataDB {
         owner: String,
     ) -> anyhow::Result<Option<Metadata>> {
         let res = self.conn.call(move |conn| {
-            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND delete_time != 0 ORDER BY delete_time ASC LIMIT 1")?;
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, dup_identifier, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND delete_time != 0 ORDER BY delete_time ASC LIMIT 1")?;
             let mut res = statement
                 .query_map(params![owner], |row| {
                     let metadata = Metadata {
@@ -333,10 +377,11 @@ impl MetadataDB {
                         permissions: row.get(8)?,
                         r#type: row.get(9)?,
                         classification: row.get(10)?,
-                        duplication: row.get(11)?,
-                        create_time: row.get(12)?,
-                        update_time: row.get(13)?,
-                        delete_time: row.get(14)?,
+                        dup_identifier: row.get(11)?,
+                        duplication: row.get(12)?,
+                        create_time: row.get(13)?,
+                        update_time: row.get(14)?,
+                        delete_time: row.get(15)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?

@@ -1,4 +1,5 @@
 use coordinator::pool::automatic::Submitter;
+use tracing::error;
 
 use super::server::ThreadPoolResult;
 
@@ -24,11 +25,19 @@ impl Delete {
             submitter,
         } = self;
         match submitter.submit(move || {
-            match std::fs::rename(filepath, trash_path) {
+            _ = std::fs::create_dir_all(
+                    std::path::Path::new(&trash_path)
+                        .parent()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                );
+            match std::fs::rename(&filepath, &trash_path) {
                 Ok(_) => {
                     ThreadPoolResult::None
                 }
                 Err(e) => {
+                    error!("move file from {} to {} error {}", filepath, trash_path, e);
                     ThreadPoolResult::Err(anyhow::anyhow!(e.to_string()))
                 }
             }
@@ -65,6 +74,13 @@ impl Restore {
             submitter,
         } = self;
         match submitter.submit(move || {
+            _ = std::fs::create_dir_all(
+                    std::path::Path::new(&restore_path)
+                        .parent()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                );
             match std::fs::rename(filepath, restore_path) {
                 Ok(_) => {
                     ThreadPoolResult::None
