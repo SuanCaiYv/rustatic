@@ -145,14 +145,29 @@ impl MetadataDB {
         Ok(())
     }
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) async fn delete(&self, id: i64) -> anyhow::Result<()> {
         self.conn
             .call(move |conn| {
                 let mut stmt = conn
-                    .prepare("UPDATE metadata SET delete_time = ?1 WHERE id = ?2")
+                    .prepare("UPDATE metadata SET delete_time = ?1 WHERE id = ?2 AND delete_at = 0")
                     .unwrap();
                 stmt.execute(params![chrono::Local::now().timestamp(), id])
+                    .unwrap();
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    pub(crate) async fn remove(&self, id: i64) -> anyhow::Result<()> {
+        self.conn
+            .call(move |conn| {
+                let mut stmt = conn
+                    .prepare("DELETE FROM metadata WHERE id = ?1")
+                    .unwrap();
+                stmt.execute(params![id])
                     .unwrap();
                 Ok::<(), rusqlite::Error>(())
             })
@@ -269,6 +284,43 @@ impl MetadataDB {
             let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND filename = ?2 ORDER BY duplication DESC LIMIT 1")?;
             let mut res = statement
                 .query_map(params![owner, filename], |row| {
+                    let metadata = Metadata {
+                        id: row.get(0)?,
+                        filename: row.get(1)?,
+                        owner: row.get(2)?,
+                        link: row.get(3)?,
+                        size: row.get(4)?,
+                        sha256: row.get(5)?,
+                        filepath: row.get(6)?,
+                        encrypt_key: row.get(7)?,
+                        permissions: row.get(8)?,
+                        r#type: row.get(9)?,
+                        classification: row.get(10)?,
+                        duplication: row.get(11)?,
+                        create_time: row.get(12)?,
+                        update_time: row.get(13)?,
+                        delete_time: row.get(14)?,
+                    };
+                    Ok::<Metadata, rusqlite::Error>(metadata)
+                })?
+                .collect::<Result<Vec<Metadata>, rusqlite::Error>>()?;
+            if res.len() == 0 {
+                Ok::<Option<Metadata>, rusqlite::Error>(None)
+            } else {
+                Ok::<Option<Metadata>, rusqlite::Error>(Some(res.remove(0)))
+            }
+        }).await?;
+        Ok(res)
+    }
+
+    pub(crate) async fn get_recently_delete_by_owner(
+        &self,
+        owner: String,
+    ) -> anyhow::Result<Option<Metadata>> {
+        let res = self.conn.call(move |conn| {
+            let mut statement = conn.prepare("SELECT id, filename, owner, link, size, sha256, filepath, encrypt_key, permissions, type, classification, duplication, create_time, update_time, delete_time FROM metadata WHERE owner = ?1 AND delete_time != 0 ORDER BY delete_time ASC LIMIT 1")?;
+            let mut res = statement
+                .query_map(params![owner], |row| {
                     let metadata = Metadata {
                         id: row.get(0)?,
                         filename: row.get(1)?,

@@ -1,9 +1,9 @@
 use std::{
-    cell::UnsafeCell,
     net::SocketAddr,
     ops::Range,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -26,11 +26,13 @@ use crate::{
     db::{get_metadata_ops, get_user_ops, metadata::Metadata, user::User},
     net::rename::Rename,
 };
+use crate::net::delete::{Delete, Restore};
 
-use super::{download::Download, upload::Upload};
+use super::{delete::Remove, download::Download, upload::Upload};
 
 pub(self) const ALPN_RUSTATIC: &[&[u8]] = &[b"rustatic"];
 pub(self) const SPLIT_FIELD_LENGTH: usize = 2;
+pub(self) const DELAY_DELETE: u64 = 30 * 24 * 60 * 60 * 1000;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -73,13 +75,13 @@ impl Server {
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let data_listener = TcpListener::bind(
             format!("0.0.0.0:{}", data_port)
                 .parse::<SocketAddr>()
                 .unwrap(),
         )
-        .await?;
+            .await?;
         let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
         let data_conn_map = Arc::new(DashMap::new());
@@ -160,7 +162,10 @@ impl Request {
 
     pub(self) async fn handle(&mut self) -> anyhow::Result<()> {
         let buffer = UnsafeBuffer::new(4096);
-        let mut curr_user: Option<String> = None;
+        let (waker_tx, waker_rx) = mpsc::channel(2);
+        let mut waker_rx = Some(waker_rx);
+        let mut curr_user = String::from("");
+
         loop {
             let (op_code, req) = match self.read_req(&buffer).await {
                 Ok(res) => res,
@@ -173,7 +178,7 @@ impl Request {
                 1 => {
                     let username = String::from_utf8_lossy(req[0]).to_string();
                     let password = String::from_utf8_lossy(req[1]).to_string();
-                    curr_user = Some(username.clone());
+                    curr_user = username.clone();
                     if let Err(e) = Self::sign(&username, &password).await {
                         error!("sign error: {}", e);
                         self.write_resp(Some(e.to_string().as_str()), vec![])
@@ -186,20 +191,23 @@ impl Request {
                     );
                     let session_id = engine.encode(uuid);
                     self.write_resp(None, vec![session_id.as_bytes()]).await?;
+                    if !waker_rx.is_some() {
+                        self.background_rm(self.cmd_map.get(&session_id).unwrap().clone(), curr_user.clone(), waker_rx.take().unwrap());
+                    }
                 }
                 // login
                 2 => {
                     let username = String::from_utf8_lossy(req[0]).to_string();
                     let password = String::from_utf8_lossy(req[1]).to_string();
                     // check for allow multiple login to enable more streams with purpose of concurrent transit.
-                    if let Some(ref curr_user) = curr_user {
-                        if curr_user != &username {
+                    if curr_user.len() != 0 {
+                        if curr_user != username {
                             error!("user not match");
                             self.write_resp(Some("user not match"), vec![]).await?;
                             continue;
                         }
                     } else {
-                        curr_user = Some(username.clone());
+                        curr_user = username.clone();
                     }
                     if let Err(e) = Self::login(&username, &password).await {
                         error!("login error: {}", e);
@@ -214,6 +222,9 @@ impl Request {
                     );
                     let session_id = engine.encode(uuid);
                     self.write_resp(None, vec![session_id.as_bytes()]).await?;
+                    if !waker_rx.is_some() {
+                        self.background_rm(self.cmd_map.get(&session_id).unwrap().clone(), curr_user.clone(), waker_rx.take().unwrap());
+                    }
                 }
                 // upload
                 3 => {
@@ -231,13 +242,13 @@ impl Request {
                     let filepath = format!(
                         "{}/{}/{}",
                         self.root_folder,
-                        curr_user.as_ref().unwrap(),
+                        curr_user,
                         filename
                     );
                     let mut tag = 0;
                     if let Ok(same_name_record) = get_metadata_ops()
                         .await
-                        .get_by_owner_filename(curr_user.clone().unwrap(), filename.clone())
+                        .get_by_owner_filename(curr_user.clone(), filename.clone())
                         .await
                     {
                         if let Some(record) = same_name_record {
@@ -247,7 +258,7 @@ impl Request {
                     let metadata = Metadata {
                         id: 0,
                         filename: filename.clone(),
-                        owner: curr_user.clone().unwrap(),
+                        owner: curr_user.clone(),
                         link: link.clone(),
                         size,
                         sha256: "".to_owned(),
@@ -261,13 +272,8 @@ impl Request {
                         update_time: chrono::Local::now().timestamp_millis(),
                         delete_time: 0,
                     };
-                    match get_metadata_ops().await.insert(metadata).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("insert metadata error: {}", e);
-                            break;
-                        }
-                    }
+                    get_metadata_ops().await.insert(metadata).await?;
+
                     // to handle damn stupid lifetime check.
                     let mut flag = false;
                     match self.cmd_map.get(session_id.as_str()) {
@@ -279,6 +285,7 @@ impl Request {
                             error!("session id not found");
                         }
                     }
+
                     if flag {
                         self.write_resp(None, vec![link.as_bytes()]).await?;
                     } else {
@@ -289,20 +296,15 @@ impl Request {
                 4 => {
                     let session_id = String::from_utf8_lossy(req[0]).to_string();
                     let link = String::from_utf8_lossy(req[1]).to_string();
-                    let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await {
-                        Ok(res) => match res {
-                            Some(v) => v,
-                            None => {
-                                error!("metadata not found");
-                                self.write_resp(Some("file not found"), vec![]).await?;
-                                continue;
-                            }
-                        },
-                        Err(e) => {
-                            error!("get metadata error: {}", e);
-                            break;
+                    let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await? {
+                        Some(v) => v,
+                        None => {
+                            error!("metadata not found");
+                            self.write_resp(Some("file not found"), vec![]).await?;
+                            continue;
                         }
                     };
+
                     let mut flag = false;
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
@@ -313,6 +315,7 @@ impl Request {
                             error!("session id not found");
                         }
                     }
+
                     if flag {
                         let mut data = [0; 8];
                         byteorder::BigEndian::write_i64(&mut data, metadata.size);
@@ -326,20 +329,15 @@ impl Request {
                 5 => {
                     let session_id = String::from_utf8_lossy(req[0]).to_string();
                     let link = String::from_utf8_lossy(req[1]).to_string();
-                    let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await {
-                        Ok(res) => match res {
-                            Some(v) => v,
-                            None => {
-                                error!("metadata not found");
-                                self.write_resp(Some("file not found"), vec![]).await?;
-                                continue;
-                            }
-                        },
-                        Err(e) => {
-                            error!("get metadata error: {}", e);
-                            break;
+                    let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await? {
+                        Some(v) => v,
+                        None => {
+                            error!("metadata not found");
+                            self.write_resp(Some("file not found"), vec![]).await?;
+                            continue;
                         }
                     };
+
                     let mut flag = false;
                     match self.cmd_map.get(session_id.as_str()) {
                         Some(cmd_tx) => {
@@ -355,6 +353,7 @@ impl Request {
                             error!("session id not found");
                         }
                     }
+
                     if flag {
                         let mut data = [0; 8];
                         byteorder::BigEndian::write_i64(&mut data, metadata.size);
@@ -367,100 +366,81 @@ impl Request {
                 // list files
                 6 => {
                     let username = String::from_utf8_lossy(req[0]).to_string();
-                    match get_metadata_ops()
+                    let res = get_metadata_ops()
                         .await
                         .list_by_owner(username.to_string())
-                        .await
-                    {
-                        Ok(res) => {
-                            let buf = UnsafeBuffer::new(8 * 5 * res.len());
-                            let mut idx = 0;
-                            let mut data = vec![];
-                            for m in res.iter() {
-                                data.push(m.filename.as_bytes());
-                                byteorder::BigEndian::write_i64(
-                                    buf.get_mut_slice(idx..idx + 8),
-                                    m.size,
-                                );
-                                data.push(buf.get_slice(idx..idx + 8));
-                                idx += 8;
-                                byteorder::BigEndian::write_i64(
-                                    buf.get_mut_slice(idx..idx + 8),
-                                    m.duplication,
-                                );
-                                data.push(buf.get_slice(idx..idx + 8));
-                                idx += 8;
-                                byteorder::BigEndian::write_i64(
-                                    buf.get_mut_slice(idx..idx + 8),
-                                    m.create_time,
-                                );
-                                data.push(buf.get_slice(idx..idx + 8));
-                                idx += 8;
-                                byteorder::BigEndian::write_i64(
-                                    buf.get_mut_slice(idx..idx + 8),
-                                    m.update_time,
-                                );
-                                data.push(buf.get_slice(idx..idx + 8));
-                                idx += 8;
-                                byteorder::BigEndian::write_i64(
-                                    buf.get_mut_slice(idx..idx + 8),
-                                    m.delete_time,
-                                );
-                                data.push(buf.get_slice(idx..idx + 8));
-                                idx += 8;
-                                data.push(m.link.as_bytes());
-                            }
-                            self.write_resp(None, data).await?;
-                        }
-                        Err(e) => {
-                            error!("list metadata error: {}", e);
-                            self.write_resp(Some("list files failed"), vec![]).await?;
-                            break;
-                        }
+                        .await?;
+                    let buf = UnsafeBuffer::new(8 * 5 * res.len());
+                    let mut idx = 0;
+                    let mut data = vec![];
+                    for m in res.iter() {
+                        data.push(m.filename.as_bytes());
+                        byteorder::BigEndian::write_i64(
+                            buf.get_mut_slice(idx..idx + 8),
+                            m.size,
+                        );
+                        data.push(buf.get_slice(idx..idx + 8));
+                        idx += 8;
+                        byteorder::BigEndian::write_i64(
+                            buf.get_mut_slice(idx..idx + 8),
+                            m.duplication,
+                        );
+                        data.push(buf.get_slice(idx..idx + 8));
+                        idx += 8;
+                        byteorder::BigEndian::write_i64(
+                            buf.get_mut_slice(idx..idx + 8),
+                            m.create_time,
+                        );
+                        data.push(buf.get_slice(idx..idx + 8));
+                        idx += 8;
+                        byteorder::BigEndian::write_i64(
+                            buf.get_mut_slice(idx..idx + 8),
+                            m.update_time,
+                        );
+                        data.push(buf.get_slice(idx..idx + 8));
+                        idx += 8;
+                        byteorder::BigEndian::write_i64(
+                            buf.get_mut_slice(idx..idx + 8),
+                            m.delete_time,
+                        );
+                        data.push(buf.get_slice(idx..idx + 8));
+                        idx += 8;
+                        data.push(m.link.as_bytes());
                     }
+                    self.write_resp(None, data).await?;
                 }
                 // rename file
                 7 => {
                     let session_id = String::from_utf8_lossy(req[0]).to_string();
                     let link = String::from_utf8_lossy(req[1]).to_string();
                     let new_name = String::from_utf8_lossy(req[2]).to_string();
+
                     let mut metadata =
-                        match get_metadata_ops().await.get_by_link(link.clone()).await {
-                            Ok(res) => match res {
-                                Some(v) => v,
-                                None => {
-                                    error!("metadata not found");
-                                    self.write_resp(Some("file not found"), vec![]).await?;
-                                    continue;
-                                }
-                            },
-                            Err(e) => {
-                                error!("get metadata error: {}", e);
-                                break;
+                        match get_metadata_ops().await.get_by_link(link.clone()).await? {
+                            Some(v) => v,
+                            None => {
+                                error!("metadata not found");
+                                self.write_resp(Some("file not found"), vec![]).await?;
+                                continue;
                             }
                         };
                     match get_metadata_ops()
                         .await
-                        .get_by_owner_filename(curr_user.clone().unwrap(), new_name.clone())
-                        .await
+                        .get_by_owner_filename(curr_user.clone(), new_name.clone())
+                        .await?
                     {
-                        Ok(res) => match res {
-                            Some(_v) => {
-                                error!("same file name already existed");
-                                self.write_resp(
-                                    Some("same name for new filename already existed"),
-                                    vec![],
-                                )
+                        Some(_v) => {
+                            error!("same file name already existed");
+                            self.write_resp(
+                                Some("same name for new filename already existed"),
+                                vec![],
+                            )
                                 .await?;
-                                continue;
-                            }
-                            None => {}
-                        },
-                        Err(e) => {
-                            error!("get metadata error: {}", e);
-                            break;
+                            continue;
                         }
+                        None => {}
                     };
+
                     let path = Path::new(metadata.filepath.as_str());
                     let dir_path = path.parent().unwrap_or_else(|| Path::new(""));
                     let new_filepath = dir_path
@@ -481,6 +461,7 @@ impl Request {
                             error!("session id not found");
                         }
                     }
+
                     if flag {
                         metadata.filename = new_name;
                         metadata.filepath = new_filepath;
@@ -491,11 +472,143 @@ impl Request {
                     }
                 }
                 // delete file(hide file for 30 days)
-                8 => {}
+                8 => {
+                    let session_id = String::from_utf8_lossy(req[0]).to_string();
+                    let link = String::from_utf8_lossy(req[1]).to_string();
+
+                    let mut metadata = match get_metadata_ops().await.get_by_link(link.clone()).await? {
+                        Some(v) => v,
+                        None => {
+                            error!("metadata not found");
+                            self.write_resp(Some("file not found"), vec![]).await?;
+                            continue;
+                        }
+                    };
+
+                    let filepath = metadata.filepath.clone();
+                    let path = Path::new(&filepath);
+                    let dir_path = path.parent().unwrap_or_else(|| Path::new(""));
+                    let trash_path = dir_path
+                        .join(".Trash")
+                        .join(&metadata.filename)
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+
+                    let mut flag = false;
+                    match self.cmd_map.get(session_id.as_str()) {
+                        Some(cmd_tx) => {
+                            cmd_tx
+                                .send(Cmd::Delete(filepath, trash_path.clone()))
+                                .await?;
+                            flag = true;
+                        }
+                        None => {
+                            error!("session id not found");
+                        }
+                    }
+
+                    if flag {
+                        metadata.filepath = trash_path;
+                        metadata.delete_time = chrono::Local::now().timestamp_millis();
+                        get_metadata_ops().await.update(metadata).await?;
+                        self.write_resp(None, vec![]).await?;
+                    } else {
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
+                    }
+                    _ = waker_tx.send(()).await;
+                }
                 // restore file
-                9 => {}
+                9 => {
+                    let session_id = String::from_utf8_lossy(req[0]).to_string();
+                    let link = String::from_utf8_lossy(req[1]).to_string();
+                    let mut metadata =
+                        match get_metadata_ops().await.get_by_link(link.clone()).await? {
+                            Some(v) => v,
+                            None => {
+                                error!("metadata not found");
+                                self.write_resp(Some("file not found"), vec![]).await?;
+                                continue;
+                            }
+                        };
+
+                    if metadata.delete_time != 0
+                        && metadata.delete_time + DELAY_DELETE as i64
+                        >= chrono::Local::now().timestamp_millis()
+                    {
+                        metadata.delete_time = 0;
+                        metadata.update_time = chrono::Local::now().timestamp_millis();
+                    } else {
+                        self.write_resp(Some("file can not be restored"), vec![])
+                            .await?;
+                        continue;
+                    }
+
+                    let filepath = metadata.filepath.clone();
+                    let path = Path::new(&filepath);
+                    let dir_path = path.parent().unwrap().parent().unwrap_or_else(|| Path::new(""));
+                    let restore_path = dir_path
+                        .join(&metadata.filename)
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+
+                    let mut flag = false;
+                    match self.cmd_map.get(session_id.as_str()) {
+                        Some(cmd_tx) => {
+                            cmd_tx
+                                .send(Cmd::Restore(filepath, restore_path.clone()))
+                                .await?;
+                            flag = true;
+                        }
+                        None => {
+                            error!("session id not found");
+                        }
+                    }
+
+                    if flag {
+                        metadata.filepath = restore_path;
+                        get_metadata_ops().await.update(metadata).await?;
+                        self.write_resp(None, vec![]).await?;
+                    } else {
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
+                    }
+                }
                 // confirm delete file
-                10 => {}
+                10 => {
+                    let session_id = String::from_utf8_lossy(req[0]).to_string();
+                    let link = String::from_utf8_lossy(req[1]).to_string();
+                    let metadata = match get_metadata_ops().await.get_by_link(link.clone()).await? {
+                        Some(v) => v,
+                        None => {
+                            error!("metadata not found");
+                            self.write_resp(Some("file not found"), vec![]).await?;
+                            continue;
+                        }
+                    };
+
+                    let filepath = metadata.filepath.clone();
+
+                    let mut flag = false;
+                    match self.cmd_map.get(session_id.as_str()) {
+                        Some(cmd_tx) => {
+                            cmd_tx
+                                .send(Cmd::Remove(filepath))
+                                .await?;
+                            flag = true;
+                        }
+                        None => {
+                            error!("session id not found");
+                        }
+                    }
+
+                    if flag {
+                        get_metadata_ops().await.remove(metadata.id).await?;
+                        self.write_resp(None, vec![]).await?;
+                    } else {
+                        self.write_resp(Some("bad session_id"), vec![]).await?;
+                    }
+                }
                 _ => {
                     error!("unknown op code: {}", op_code);
                     break;
@@ -620,6 +733,41 @@ impl Request {
             .to_string()
             .to_uppercase()
     }
+
+    pub(self) fn background_rm(&self, cmd_tx: mpsc::Sender<Cmd>, owner: String, mut waker: mpsc::Receiver<()>) {
+        tokio::spawn(async move {
+            loop {
+                match get_metadata_ops()
+                    .await
+                    .get_recently_delete_by_owner(owner.clone())
+                    .await
+                {
+                    Ok(res) => {
+                        if let Some(res) = res {
+                            let future_ms = res.delete_time as u64 + DELAY_DELETE;
+                            let now_ms = chrono::Local::now().timestamp_millis() as u64;
+                            if res.delete_time != 0 && future_ms <= now_ms {
+                                _ = get_metadata_ops().await.remove(res.id).await;
+                                _ = cmd_tx
+                                    .send(Cmd::Remove(res.filepath))
+                                    .await;
+                            } else {
+                                let instant =
+                                    future_ms - chrono::Local::now().timestamp_millis() as u64;
+                                tokio::time::sleep(Duration::from_millis(instant)).await;
+                            }
+                        } else {
+                            _ = waker.recv().await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("list recently deleted file error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
 }
 
 pub(super) enum ThreadPoolResult {
@@ -678,10 +826,9 @@ impl DataConnection {
                         self.download_directly(filepath, size).await?
                     }
                     Cmd::Rename(filepath, new_name) => self.rename(filepath, new_name).await?,
-                    Cmd::DeleteFalsely(filepath) => self.delete_falsely(filepath.as_str()).await?,
-                    Cmd::DeleteImmediately(filepath) => {
-                        self.delete_immediately(filepath.as_str()).await?
-                    }
+                    Cmd::Delete(filepath, trash_path) => self.delete(filepath, trash_path).await?,
+                    Cmd::Restore(filepath, restore_path) => self.restore(filepath, restore_path).await?,
+                    Cmd::Remove(filepath) => self.remove(filepath).await?,
                 },
                 None => break,
             }
@@ -696,8 +843,8 @@ impl DataConnection {
             self.submitter.clone(),
             &mut self.stream,
         )
-        .run()
-        .await?;
+            .run()
+            .await?;
         Ok(())
     }
 
@@ -707,8 +854,8 @@ impl DataConnection {
             self.submitter.clone(),
             &mut self.stream,
         )
-        .run()
-        .await?;
+            .run()
+            .await?;
         Ok(())
     }
 
@@ -744,12 +891,16 @@ impl DataConnection {
             .await
     }
 
-    pub(self) async fn delete_falsely(&mut self, filepath: &str) -> anyhow::Result<()> {
-        todo!("")
+    pub(self) async fn delete(&mut self, filepath: String, trash_path: String) -> anyhow::Result<()> {
+        Delete::new(filepath, trash_path, self.submitter.clone()).run().await
     }
 
-    pub(self) async fn delete_immediately(&mut self, filepath: &str) -> anyhow::Result<()> {
-        todo!("")
+    pub(self) async fn restore(&mut self, filepath: String, restore_path: String) -> anyhow::Result<()> {
+        Restore::new(filepath, restore_path, self.submitter.clone()).run().await
+    }
+
+    pub(self) async fn remove(&mut self, filepath: String) -> anyhow::Result<()> {
+        Remove::new(filepath, self.submitter.clone()).run().await
     }
 }
 
@@ -758,38 +909,10 @@ pub(self) enum Cmd {
     Download(String),
     DownloadDirectly(String, usize),
     Rename(String, String),
-    DeleteFalsely(String),
-    DeleteImmediately(String),
+    Delete(String, String),
+    Restore(String, String),
+    Remove(String),
 }
-
-pub(super) struct UnsafePlaceholder<T> {
-    value: UnsafeCell<Option<T>>,
-}
-
-impl<T> UnsafePlaceholder<T> {
-    #[allow(unused)]
-    pub fn new() -> Self {
-        Self {
-            value: UnsafeCell::new(None),
-        }
-    }
-
-    #[allow(unused)]
-    pub fn set(&self, new_value: T) {
-        unsafe {
-            (&mut (*self.value.get())).replace(new_value);
-        }
-    }
-
-    #[allow(unused)]
-    pub fn get(&self) -> Option<T> {
-        unsafe { (&mut (*self.value.get())).take() }
-    }
-}
-
-unsafe impl<T> Send for UnsafePlaceholder<T> {}
-
-unsafe impl<T> Sync for UnsafePlaceholder<T> {}
 
 pub(self) struct UnsafeBuffer {
     data: Vec<u8>,

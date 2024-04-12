@@ -31,7 +31,7 @@ impl<'a> Download<'a> {
         }
     }
 
-    pub(super) async fn run(&mut self) -> anyhow::Result<()> {
+    pub(super) async fn run(self) -> anyhow::Result<()> {
         let file = OpenOptions::new().read(true).open(self.filepath.as_str())?;
         let size: usize = file.metadata()?.len() as usize;
         let file_fd = UnsafeFD {

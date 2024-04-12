@@ -29,8 +29,11 @@ impl<'a> Upload<'a> {
         }
     }
 
-    pub(super) async fn run(&mut self) -> anyhow::Result<()> {
-        let filepath = self.filepath.clone();
+    pub(super) async fn run(mut self) -> anyhow::Result<()> {
+        let Self {
+            filepath,
+            ..
+        } = self;
         let (tx, rx) = flume::bounded::<(Arc<Vec<u8>>, usize)>(1);
         let submitter = self.submitter.clone();
 
