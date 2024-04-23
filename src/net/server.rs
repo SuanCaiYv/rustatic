@@ -92,7 +92,6 @@ impl Server {
                         continue;
                     }
                 };
-                info!("new data connection");
 
                 let conn_map = conn_map.clone();
                 let submitter = thread_pool.new_submitter();
@@ -105,7 +104,6 @@ impl Server {
                         return Err(anyhow!("data connection init error"));
                     }
                     let session_id = session_id.unwrap();
-                    info!("insert session map: {}", session_id);
                     conn_map.insert(session_id, cmd_tx);
 
                     if let Err(e) = data_connection.handle().await {
@@ -832,6 +830,7 @@ impl DataConnection {
             for i in idx..idx + n {
                 if buf[i] == b'\n' {
                     self.session_id = String::from_utf8_lossy(&buf[0..i]).to_string();
+                    self.stream.write_u64(12).await?;
                     return Ok(self.session_id.clone());
                 }
             }
