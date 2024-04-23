@@ -92,6 +92,7 @@ impl Server {
                         continue;
                     }
                 };
+                info!("new data connection");
 
                 let conn_map = conn_map.clone();
                 let submitter = thread_pool.new_submitter();
