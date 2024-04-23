@@ -104,6 +104,7 @@ impl Server {
                         return Err(anyhow!("data connection init error"));
                     }
                     let session_id = session_id.unwrap();
+                    info!("insert session map: {}", session_id);
                     conn_map.insert(session_id, cmd_tx);
 
                     if let Err(e) = data_connection.handle().await {
