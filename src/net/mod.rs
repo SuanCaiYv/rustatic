@@ -8,6 +8,8 @@ use tokio::net::TcpStream;
 pub(self) mod download;
 pub(crate) mod server;
 pub(self) mod upload;
+pub(self) mod rename;
+pub(self) mod delete;
 
 #[derive(Clone, Copy)]
 pub(super) struct UnsafeFD {
