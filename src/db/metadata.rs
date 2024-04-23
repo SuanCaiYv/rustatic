@@ -230,11 +230,11 @@ impl MetadataDB {
                         permissions: row.get(8)?,
                         r#type: row.get(9)?,
                         classification: row.get(10)?,
-                        dup_identifier: row.get(10)?,
-                        duplication: row.get(11)?,
-                        create_time: row.get(12)?,
-                        update_time: row.get(13)?,
-                        delete_time: row.get(14)?,
+                        dup_identifier: row.get(11)?,
+                        duplication: row.get(12)?,
+                        create_time: row.get(13)?,
+                        update_time: row.get(14)?,
+                        delete_time: row.get(15)?,
                     };
                     Ok::<Metadata, rusqlite::Error>(metadata)
                 })?
