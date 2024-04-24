@@ -274,7 +274,7 @@ impl Request {
                         permissions: "private".to_owned(),
                         r#type: "".to_owned(),
                         classification: "".to_owned(),
-                        dup_identifier: dup_identifier,
+                        dup_identifier,
                         duplication: tag,
                         create_time: chrono::Local::now().timestamp_millis(),
                         update_time: chrono::Local::now().timestamp_millis(),
